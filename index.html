@@ -167,31 +167,34 @@ async function fetchData(){
   try{
     const data = await fetchPositions(key, secret);
     if(!Array.isArray(data)) throw new Error("返回异常: "+JSON.stringify(data));
-    // 只显示列表里的交易对且有持仓的
-    const rows = [];
+    // 列出所有交易对，无持仓的也显示
+    const posMap = {};
     for(const p of data){
       const amt = parseFloat(p.positionAmt)||0;
       if(amt===0) continue;
       if(!PAIRS.includes(p.symbol)) continue;
-      const info = positionInfo(p);
-      rows.push({symbol:p.symbol, ...info});
+      posMap[p.symbol] = positionInfo(p);
     }
-    if(!rows.length){
-      tbody.innerHTML = '<tr><td colspan="4" class="empty">指定交易对无持仓</td></tr>';
-    }else{
-      tbody.innerHTML = rows.map(r=>{
-        const dirCls = r.amt>0 ? "long" : "short";
-        const dirTxt = r.amt>0 ? "多" : "空";
-        const roiCls = r.roi>=0 ? "roi-pos" : "roi-neg";
-        return '<tr>'+
-          '<td class="sym">'+r.symbol+'</td>'+
-          '<td class="'+dirCls+'">'+dirTxt+'</td>'+
-          '<td class="num">$'+r.notional.toLocaleString("en-US",{maximumFractionDigits:2})+'</td>'+
-          '<td class="num '+roiCls+'">'+(r.roi>=0?"+":"")+r.roi.toFixed(2)+'%</td>'+
-        '</tr>';
-      }).join("");
-    }
-    document.getElementById("status").textContent = "已加载 "+rows.length+" 条持仓 · "+new Date().toLocaleTimeString("zh-CN",{hour12:false});
+    const rows = PAIRS.map(sym => {
+      const info = posMap[sym];
+      if(info) return {symbol:sym, ...info};
+      return {symbol:sym, amt:0, mark:0, unrealized:0, roi:0, notional:0};
+    });
+    tbody.innerHTML = rows.map(r=>{
+      const hasPos = r.notional > 0;
+      const dirCls = !hasPos ? "" : (r.amt>0 ? "long" : "short");
+      const dirTxt = !hasPos ? "-" : (r.amt>0 ? "多" : "空");
+      const roiCls = !hasPos ? "" : (r.roi>=0 ? "roi-pos" : "roi-neg");
+      const roiTxt = !hasPos ? "-" : ((r.roi>=0?"+":"")+r.roi.toFixed(2)+"%");
+      const notionalTxt = !hasPos ? "-" : ("$"+r.notional.toLocaleString("en-US",{maximumFractionDigits:2}));
+      return '<tr'+(hasPos?'':' style="opacity:.45"')+'>'+
+        '<td class="sym">'+r.symbol+'</td>'+
+        '<td class="'+dirCls+'">'+dirTxt+'</td>'+
+        '<td class="num">'+notionalTxt+'</td>'+
+        '<td class="num '+roiCls+'">'+roiTxt+'</td>'+
+      '</tr>';
+    }).join("");
+    document.getElementById("status").textContent = "已加载 "+rows.filter(r=>r.notional>0).length+" 条持仓 / 共 "+rows.length+" 个交易对 · "+new Date().toLocaleTimeString("zh-CN",{hour12:false});
   }catch(e){
     tbody.innerHTML = '<tr><td colspan="4" class="empty">加载失败: '+e.message+'</td></tr>';
     document.getElementById("status").textContent = "失败: "+e.message;
