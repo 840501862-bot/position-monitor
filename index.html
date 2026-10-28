@@ -243,8 +243,13 @@ async function fetchData(){
     ]);
     let warnMsg = "";
     if(!Array.isArray(deliveryData)){
-      warnMsg = "交割合约接口异常: " + JSON.stringify(deliveryData).substring(0,120);
+      warnMsg = "交割合约接口异常: " + JSON.stringify(deliveryData).substring(0,200);
     }
+    // debug: 显示交割合约原始返回
+    let debugHtml = '<div style="margin:10px 16px;padding:10px;background:#1a0a0a;border:1px solid #ef4444;border-radius:6px;font-family:Consolas,monospace;font-size:11px;color:#ff8888;max-height:200px;overflow:auto">';
+    debugHtml += "<b>交割合约原始返回:</b><br>" + JSON.stringify(deliveryData, null, 1).substring(0,1500);
+    debugHtml += "<br><b>合约映射表:</b><br>" + JSON.stringify(delMap);
+    debugHtml += "</div>";
     // 按显示名分组收集持仓
     const posMap = {};
     // U本位持仓
@@ -312,7 +317,7 @@ async function fetchData(){
       }
       html += '</div>';
     }
-    container.innerHTML = html;
+    container.innerHTML = debugHtml + html;
     document.getElementById("status").textContent = "已加载 "+totalPos+" 条持仓 / 共 "+PAIRS.length+" 个交易对 · "+new Date().toLocaleTimeString("zh-CN",{hour12:false})+(warnMsg?" · ⚠ "+warnMsg:"");
   }catch(e){
     container.innerHTML = '<div class="empty">加载失败: '+e.message+'</div>';
