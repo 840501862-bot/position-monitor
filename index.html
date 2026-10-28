@@ -104,12 +104,13 @@
 <script>
 "use strict";
 const FAPI = "https://fapi.binance.com";
-const PAIRS = ["BTCUSDT","BTCUSDC","BTCUSD1",
-  "ETHUSDT","ETHUSDC","ETHUSD1",
+const DAPI = "https://dapi.binance.com";
+const PAIRS = ["BTCUSDT","BTCUSDC","BTCUSD1","BTCU",
+  "ETHUSDT","ETHUSDC","ETHUSD1","ETHU",
   "XAUUSDT","XAUTUSDT","PAXGUSDT"];
 const GROUPS = [
-  {label:"BTC", pairs:["BTCUSDT","BTCUSDC","BTCUSD1"]},
-  {label:"ETH", pairs:["ETHUSDT","ETHUSDC","ETHUSD1"]},
+  {label:"BTC", pairs:["BTCUSDT","BTCUSDC","BTCUSD1","BTCU"]},
+  {label:"ETH", pairs:["ETHUSDT","ETHUSDC","ETHUSD1","ETHU"]},
   {label:"黄金", pairs:["XAUUSDT","XAUTUSDT","PAXGUSDT"]},
 ];
 const KEY_STORE = "bc_keys_v1";
@@ -157,6 +158,18 @@ async function fetchPositions(key, secret){
   const sig = await hexSign(secret, params);
   return fetchJson(FAPI+"/fapi/v2/positionRisk?"+params+"&signature="+sig, 20000, key);
 }
+// Coin-M 永续持仓
+async function fetchDeliveryPositions(key, secret){
+  await ensureOffset();
+  const params = "timestamp="+(await nowMs())+"&recvWindow=10000";
+  const sig = await hexSign(secret, params);
+  return fetchJson(DAPI+"/dapi/v1/positionRisk?"+params+"&signature="+sig, 20000, key);
+}
+// Coin-M 永续合约显示名：BTCUSD_PERP→BTCU, ETHUSD_PERP→ETHU（季度交割合约不展示）
+function deliveryDisplayName(sym){
+  if(sym.endsWith("_PERP")) return sym.replace("USD_PERP","U");
+  return null;
+}
 
 function positionInfo(p){
   const amt = parseFloat(p.positionAmt)||0;
@@ -183,19 +196,13 @@ async function fetchData(){
   }
   document.getElementById("status").textContent = "正在加载…";
   try{
-    const data = await fetchPositions(key, secret);
-    // debug: 显示 U本位非零持仓
-    let nzFapi = [];
-    if(Array.isArray(data)){
-      for(const p of data){
-        if(parseFloat(p.positionAmt)!==0) nzFapi.push({sym:p.symbol, side:p.positionSide, amt:p.positionAmt});
-      }
-    }
-    let debugHtml = '<div style="margin:10px 16px;padding:10px;background:#1a0a0a;border:1px solid #ef4444;border-radius:6px;font-family:Consolas,monospace;font-size:11px;color:#ff8888;max-height:300px;overflow:auto">';
-    debugHtml += "<b>U本位非零持仓:</b> " + JSON.stringify(nzFapi);
-    debugHtml += "</div>";
+    const [data, deliveryData] = await Promise.all([
+      fetchPositions(key, secret),
+      fetchDeliveryPositions(key, secret)
+    ]);
     // 按显示名分组收集持仓
     const posMap = {};
+    // U本位持仓
     if(Array.isArray(data)){
       for(const p of data){
         const amt = parseFloat(p.positionAmt)||0;
@@ -203,6 +210,17 @@ async function fetchData(){
         if(!PAIRS.includes(p.symbol)) continue;
         if(!posMap[p.symbol]) posMap[p.symbol] = [];
         posMap[p.symbol].push(p);
+      }
+    }
+    // Coin-M 永续持仓：BTCUSD_PERP→BTCU, ETHUSD_PERP→ETHU（季度交割合约不展示）
+    if(Array.isArray(deliveryData)){
+      for(const p of deliveryData){
+        const amt = parseFloat(p.positionAmt)||0;
+        if(amt===0) continue;
+        const name = deliveryDisplayName(p.symbol);
+        if(!name || !PAIRS.includes(name)) continue;
+        if(!posMap[name]) posMap[name] = [];
+        posMap[name].push(p);
       }
     }
     let html = "";
@@ -249,7 +267,7 @@ async function fetchData(){
       }
       html += '</div>';
     }
-    container.innerHTML = debugHtml + html;
+    container.innerHTML = html;
     document.getElementById("status").textContent = "已加载 "+totalPos+" 条持仓 / 共 "+PAIRS.length+" 个交易对 · "+new Date().toLocaleTimeString("zh-CN",{hour12:false});
   }catch(e){
     container.innerHTML = '<div class="empty">加载失败: '+e.message+'</div>';
