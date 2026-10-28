@@ -104,6 +104,7 @@
 <script>
 "use strict";
 const FAPI = "https://fapi.binance.com";
+const DAPI = "https://dapi.binance.com";
 const PAIRS = ["BTCUSDT","BTCUSDC","BTCUSD1","BTCU","BTC次季","BTC当季",
   "ETHUSDT","ETHUSDC","ETHUSD1","ETHU","ETH次季","ETH当季",
   "XAUUSDT","XAUTUSDT","PAXGUSDT"];
@@ -150,6 +151,67 @@ async function fetchPositions(key, secret){
   });
   return r.json();
 }
+// Coin-M 交割合约持仓
+async function fetchDeliveryPositions(key, secret){
+  await ensureOffset();
+  const params = "timestamp="+(await nowMs())+"&recvWindow=10000";
+  const sig = await hexSign(secret, params);
+  const r = await fetch(DAPI+"/dapi/v1/positionRisk?"+params+"&signature="+sig, {
+    headers:{"X-MBX-APIKEY":key}
+  });
+  return r.json();
+}
+// 将交割合约symbol映射为显示名：BTCUSD_PERP→BTCU, BTCUSD_250926→BTC当季/次季
+function mapDeliverySymbol(sym){
+  if(sym.endsWith("_PERP")) return sym.replace("_PERP","U"); // BTCUSD_PERP→BTCU
+  const m = sym.match(/^([A-Z]+)USD_(\d{6})$/);
+  if(m){
+    const base = m[1];
+    const yy = m[2].substring(0,2), mm = m[2].substring(2,4), dd = m[2].substring(4,6);
+    const expiry = new Date(2000+parseInt(yy), parseInt(mm)-1, parseInt(dd));
+    const now = new Date();
+    // 找两个最近的季度合约：当季=最近到期，次季=第二个到期
+    // 这里由调用方排序后传入，直接返回原始symbol供分组
+    return sym;
+  }
+  return sym;
+}
+// 获取交割合约的季度合约列表，区分当季/次季
+let deliveryContractMap = null; // {displayName: actualSymbol}
+async function buildDeliveryMap(){
+  if(deliveryContractMap) return deliveryContractMap;
+  try{
+    const r = await fetch(DAPI+"/dapi/v1/exchangeInfo");
+    const d = await r.json();
+    const map = {};
+    const quarters = {BTC:[], ETH:[]};
+    for(const s of (d.symbols||[])){
+      if(s.contractType === "PERPETUAL"){
+        // BTCUSD_PERP → BTCU
+        const display = s.symbol.replace("_PERP","U");
+        map[s.symbol] = display;
+      } else if(s.contractType === "CURRENT_QUARTER" || s.contractType === "NEXT_QUARTER"){
+        const m = s.symbol.match(/^([A-Z]+)USD_(\d{6})$/);
+        if(m){
+          const base = m[1];
+          if(!quarters[base]) quarters[base] = [];
+          quarters[base].push({sym: s.symbol, expiry: s.deliveryDate, type: s.contractType});
+        }
+      }
+    }
+    // 对每个base，按到期日排序，最早=当季，次早=次季
+    for(const base of Object.keys(quarters)){
+      const list = quarters[base].sort((a,b)=>a.expiry-b.expiry);
+      if(list[0]) map[list[0].sym] = base+"当季";
+      if(list[1]) map[list[1].sym] = base+"次季";
+    }
+    deliveryContractMap = map;
+    return map;
+  }catch(e){
+    deliveryContractMap = {};
+    return {};
+  }
+}
 
 function positionInfo(p){
   const amt = parseFloat(p.positionAmt)||0;
@@ -176,16 +238,34 @@ async function fetchData(){
   }
   document.getElementById("status").textContent = "正在加载…";
   try{
-    const data = await fetchPositions(key, secret);
-    if(!Array.isArray(data)) throw new Error("返回异常: "+JSON.stringify(data));
-    // 按交易对分组收集持仓
+    // 并行获取 U本位合约 + Coin-M交割合约
+    const [data, deliveryData, delMap] = await Promise.all([
+      fetchPositions(key, secret),
+      fetchDeliveryPositions(key, secret).catch(()=>[]),
+      buildDeliveryMap()
+    ]);
+    // 按显示名分组收集持仓
     const posMap = {};
-    for(const p of data){
-      const amt = parseFloat(p.positionAmt)||0;
-      if(amt===0) continue;
-      if(!PAIRS.includes(p.symbol)) continue;
-      if(!posMap[p.symbol]) posMap[p.symbol] = [];
-      posMap[p.symbol].push(p);
+    // U本位持仓
+    if(Array.isArray(data)){
+      for(const p of data){
+        const amt = parseFloat(p.positionAmt)||0;
+        if(amt===0) continue;
+        if(!PAIRS.includes(p.symbol)) continue;
+        if(!posMap[p.symbol]) posMap[p.symbol] = [];
+        posMap[p.symbol].push(p);
+      }
+    }
+    // 交割合约持仓：symbol映射为显示名
+    if(Array.isArray(deliveryData)){
+      for(const p of deliveryData){
+        const amt = parseFloat(p.positionAmt)||0;
+        if(amt===0) continue;
+        const displayName = delMap[p.symbol] || p.symbol;
+        if(!PAIRS.includes(displayName)) continue;
+        if(!posMap[displayName]) posMap[displayName] = [];
+        posMap[displayName].push(p);
+      }
     }
     let html = "";
     let totalPos = 0;
