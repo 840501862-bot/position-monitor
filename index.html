@@ -170,6 +170,139 @@ function deliveryDisplayName(sym){
   if(sym.endsWith("_PERP")) return sym.replace("USD_PERP","U");
   return null;
 }
+function apiBase(host){ return host===DAPI ? "dapi" : "fapi"; }
+function coinMAlias(displayName){
+  if(displayName==="BTCU") return {host:DAPI, sym:"BTCUSD_PERP"};
+  if(displayName==="ETHU") return {host:DAPI, sym:"ETHUSD_PERP"};
+  return null;
+}
+// 带超时的 POST 请求（币安下单用）
+async function postJson(url, apiKey){
+  const ctl = new AbortController();
+  const t = setTimeout(()=>ctl.abort(), 20000);
+  try{
+    const r = await fetch(url, {method:"POST", headers: apiKey?{"X-MBX-APIKEY":apiKey}:{}, signal:ctl.signal});
+    const txt = await r.text();
+    try{ return JSON.parse(txt); }catch(e){ return txt; }
+  }finally{ clearTimeout(t); }
+}
+// 交易所精度表（stepSize）缓存
+let stepMapCache=null, stepMapDapiCache=null;
+async function ensureStepMap(){
+  if(stepMapCache) return;
+  try{
+    const d = await fetchJson(FAPI+"/fapi/v1/exchangeInfo", 30000);
+    stepMapCache = {};
+    for(const s of (d.symbols||[])){
+      const f = (s.filters||[]).find(x=>x.filterType==="LOT_SIZE");
+      if(f) stepMapCache[s.symbol] = parseFloat(f.stepSize);
+    }
+  }catch(e){ stepMapCache = {}; }
+}
+async function ensureStepMapDapi(){
+  if(stepMapDapiCache) return;
+  try{
+    const d = await fetchJson(DAPI+"/dapi/v1/exchangeInfo", 30000);
+    stepMapDapiCache = {};
+    for(const s of (d.symbols||[])){
+      const f = (s.filters||[]).find(x=>x.filterType==="LOT_SIZE");
+      if(f) stepMapDapiCache[s.symbol] = parseFloat(f.stepSize);
+    }
+  }catch(e){ stepMapDapiCache = {}; }
+}
+let priceCache={}, priceCacheTs=0;
+async function fetchPrice(host, sym){
+  const k = host+"|"+sym;
+  if(priceCache[k] && Date.now()-priceCacheTs<30000) return priceCache[k];
+  const d = await fetchJson(host+"/"+apiBase(host)+"/v1/ticker/price?symbol="+sym, 8000);
+  const p = d && parseFloat(d.price);
+  if(p>0){ priceCache[k]=p; priceCacheTs=Date.now(); return p; }
+  return null;
+}
+function roundDownToStep(qty, step){
+  if(!(step>0) || !(qty>0)) return null;
+  const d = Math.max(0, Math.ceil(-Math.log10(step)));
+  return Math.floor(qty*Math.pow(10,d))/Math.pow(10,d);
+}
+// 下单（U本位/币本位通用，带 positionSide 以适配对冲模式）
+async function placeOrder(host, sym, side, positionSide, qty, reduceOnly){
+  await ensureOffset();
+  const parts = ["symbol="+sym, "side="+side, "type=MARKET"];
+  if(positionSide) parts.push("positionSide="+positionSide);
+  if(qty!=null) parts.push("quantity="+qty);
+  if(reduceOnly) parts.push("reduceOnly=true");
+  parts.push("timestamp="+(await nowMs()), "recvWindow=10000");
+  const {key, secret} = getKeys();
+  const sig = await hexSign(secret, parts.join("&"));
+  return postJson(host+"/"+apiBase(host)+"/v1/order?"+parts.join("&")+"&signature="+sig, key);
+}
+function orderErrText(r){
+  if(r && typeof r==="object" && (r.msg || r.code)) return "code "+r.code+" "+r.msg;
+  return String(r);
+}
+// 每个交易对的"加仓"按钮逻辑：无仓开100USDT多单 / ROI>100%平仓 / ROI<-100%按当前数量加仓
+async function tradePair(displayName){
+  const {key, secret} = getKeys();
+  const status = document.getElementById("status");
+  if(!key || !secret){ status.textContent = "请先点「设置」填写 API Key / Secret"; openSettings(); return; }
+  const cm = coinMAlias(displayName);
+  const host = cm ? cm.host : FAPI;
+  const rawSym = cm ? cm.sym : displayName;
+  let doneMsg = "";
+  try{
+    await Promise.all([ensureStepMap(), ensureStepMapDapi()]);
+    status.textContent = "正在获取 "+displayName+" 持仓…";
+    const positions = cm ? await fetchDeliveryPositions(key, secret) : await fetchPositions(key, secret);
+    const held = (Array.isArray(positions)?positions:[]).filter(p=>{
+      const nm = cm ? deliveryDisplayName(p.symbol) : p.symbol;
+      return nm===displayName && parseFloat(p.positionAmt)!==0;
+    });
+    if(!held.length){
+      // 无仓位：市价开多 100 USDT
+      const price = await fetchPrice(host, rawSym);
+      if(!(price>0)){ status.textContent = displayName+" 获取价格失败，未开仓"; return; }
+      const step = cm ? stepMapDapiCache[rawSym] : stepMapCache[rawSym];
+      const qty = roundDownToStep(100/price, step);
+      if(!(qty>0)){ status.textContent = displayName+" 开仓数量过小（精度 "+step+"，100/价格="+(100/price).toFixed(6)+"），未开仓"; return; }
+      status.textContent = "开仓 "+displayName+" "+qty+"（≈100 USDT）…";
+      const r = await placeOrder(host, rawSym, "BUY", "LONG", qty, false);
+      doneMsg = (r && r.orderId) ? "开仓成功 "+displayName+" "+qty+"（order "+r.orderId+"）" : "开仓失败 "+displayName+"："+orderErrText(r);
+    }else{
+      // 有仓位：按持仓量最大的那笔判断
+      held.sort((a,b)=>Math.abs(parseFloat(b.positionAmt))-Math.abs(parseFloat(a.positionAmt)));
+      const pos = held[0];
+      const amt = parseFloat(pos.positionAmt);
+      const ps = pos.positionSide || (amt>0 ? "LONG" : "SHORT");
+      const info = positionInfo(pos);
+      if(info.roi > 100){
+        // 平仓：清掉该交易对全部非零持仓
+        for(const q of held){
+          const qAmt = parseFloat(q.positionAmt);
+          const qSide = q.positionSide || (qAmt>0 ? "LONG" : "SHORT");
+          const qtyStr = q.positionAmt.startsWith("-") ? q.positionAmt.slice(1) : q.positionAmt;
+          status.textContent = "平仓 "+displayName+"（ROI "+info.roi.toFixed(2)+"% > 100%）…";
+          const r = await placeOrder(host, rawSym, qSide==="LONG"?"SELL":"BUY", qSide, qtyStr, true);
+          if(!(r && r.orderId)){ status.textContent = "平仓失败 "+displayName+"："+orderErrText(r); return; }
+        }
+        doneMsg = "平仓成功 "+displayName+"（order "+held.map(h=>h.positionSide).join("/")+"）";
+      }else if(info.roi < -100){
+        // 加仓：按当前持仓数量原数量加仓
+        const step = cm ? stepMapDapiCache[rawSym] : stepMapCache[rawSym];
+        const qty = roundDownToStep(Math.abs(amt), step);
+        if(!(qty>0)){ status.textContent = displayName+" 加仓数量过小，未加仓"; return; }
+        status.textContent = "加仓 "+displayName+" "+qty+"（ROI "+info.roi.toFixed(2)+"% < -100%）…";
+        const r = await placeOrder(host, rawSym, ps==="LONG"?"BUY":"SELL", ps, qty, false);
+        doneMsg = (r && r.orderId) ? "加仓成功 "+displayName+" "+qty+"（order "+r.orderId+"）" : "加仓失败 "+displayName+"："+orderErrText(r);
+      }else{
+        doneMsg = displayName+" 回报率 "+info.roi.toFixed(2)+"%（-100%~+100% 之间），不操作";
+      }
+    }
+    await fetchData();
+    if(doneMsg) document.getElementById("status").textContent = doneMsg;
+  }catch(e){
+    status.textContent = "操作失败 "+displayName+"："+e.message;
+  }
+}
 
 function positionInfo(p){
   const amt = parseFloat(p.positionAmt)||0;
@@ -244,6 +377,7 @@ async function fetchData(){
               '<div class="c-row"><span class="lbl">方向</span><span>'+(dir==="LONG"?"多":"空")+'</span></div>'+
               '<div class="c-row"><span class="lbl">数量</span><span class="num">-</span></div>'+
               '<div class="c-row"><span class="lbl">回报率</span><span class="num">-</span></div>'+
+              '<button onclick="tradePair(\''+sym+'\')" style="width:100%;margin-top:6px;padding:3px 0;font-size:12px">加仓</button>'+
             '</div>';
             continue;
           }
@@ -261,6 +395,7 @@ async function fetchData(){
               '<div class="c-row"><span class="lbl">方向</span><span class="'+dirCls+'">'+dirTxt+'</span></div>'+
               '<div class="c-row"><span class="lbl">数量</span><span class="num">'+notionalTxt+'</span></div>'+
               '<div class="c-row"><span class="lbl">回报率</span><span class="num '+roiCls+'">'+roiTxt+'</span></div>'+
+              '<button onclick="tradePair(\''+sym+'\')" style="width:100%;margin-top:6px;padding:3px 0;font-size:12px">加仓</button>'+
             '</div>';
           }
         }
