@@ -41,6 +41,7 @@
     width: 160px; background: #142543; border: 1px solid #2a4d7f;
     border-radius: 6px; padding: 10px 12px;
   }
+  .break { flex-basis: 100%; height: 0; }
   .card .c-sym { font-weight: 700; color: #fff; font-size: 14px; margin-bottom: 6px; }
   .card .c-row { display: flex; justify-content: space-between; font-size: 12px; line-height: 1.8; }
   .card .c-row .lbl { color: #7d93ab; }
@@ -191,8 +192,9 @@ async function fetchData(){
     for(const g of GROUPS){
       html += '<div class="group-label">'+g.label+'</div>';
       html += '<div class="cards">';
-      // 先排所有多单，再排所有空单
+      // 先排所有多单，再排所有空单（中间强制换行）
       for(const dir of ["LONG","SHORT"]){
+        if(dir==="SHORT") html += '<div class="break"></div>';
         for(const sym of g.pairs){
           const positions = (posMap[sym] || []).filter(p=>{
             const side = p.positionSide || "";
