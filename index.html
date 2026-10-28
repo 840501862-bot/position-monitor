@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>持仓监控</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: "Microsoft YaHei UI","PingFang SC",system-ui,sans-serif;
+    font-size: 14px; color: #d5dee8; background: #0c1e3e; min-height: 100vh;
+  }
+  header {
+    background: linear-gradient(180deg,#0e1a2c,#0a1322); border-bottom: 1px solid #20334d;
+    padding: 12px 16px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  }
+  header h1 { font-size: 16px; color: #eaf2ff; margin-right: auto; }
+  .toolbar {
+    background: #0a1322; border-bottom: 1px solid #20334d; padding: 8px 16px;
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  }
+  button {
+    border: 1px solid #2a4d7f; border-radius: 4px; padding: 6px 16px;
+    background: #142543; color: #9cc3ff; cursor: pointer; font-size: 13px;
+  }
+  button:hover { border-color: #2f8cff; color: #cfe3ff; }
+  button.primary { background: linear-gradient(180deg,#1e7bff,#1460e0); border-color: #2f8cff; color: #fff; }
+  #status { color: #4dc3ff; font-size: 12px; }
+  table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+  thead th {
+    background: #1a3a6e; color: #8fa8c4; padding: 10px 12px; text-align: left;
+    border-bottom: 1px solid #2c5aa8; white-space: nowrap;
+  }
+  tbody td { padding: 10px 12px; border-bottom: 1px solid #2E6FBF; white-space: nowrap; }
+  tbody tr:nth-child(even) { background: rgba(58,123,213,.08); }
+  tbody tr:hover { background: rgba(58,123,213,.18); }
+  .sym { font-weight: 700; color: #fff; }
+  .long { color: #ef4444; font-weight: 700; }
+  .short { color: #22c55e; font-weight: 700; }
+  .num { font-family: Consolas, monospace; text-align: right; }
+  .roi-pos { color: #ef4444; font-weight: 700; }
+  .roi-neg { color: #22c55e; font-weight: 700; }
+  .empty { text-align: center; padding: 40px; color: #5f7d9e; }
+  .mask {
+    position: fixed; inset: 0; background: rgba(3,6,12,.7); display: none;
+    align-items: center; justify-content: center; z-index: 50;
+  }
+  .mask.show { display: flex; }
+  .modal {
+    background: #0f1a30; border: 1px solid #27405f; border-radius: 8px;
+    width: min(520px, 92vw); padding: 20px;
+  }
+  .modal h3 { color: #eaf2ff; margin-bottom: 12px; }
+  .modal input {
+    width: 100%; background: #0a1322; border: 1px solid #2b4a6e; border-radius: 4px;
+    color: #d5dee8; padding: 8px 10px; margin-bottom: 8px; font-size: 13px;
+    font-family: Consolas, monospace; outline: none;
+  }
+  .modal input:focus { border-color: #2f8cff; }
+  .modal .row { display: flex; gap: 8px; margin-top: 12px; justify-content: flex-end; }
+  .modal .hint { color: #5f7d9e; font-size: 11px; margin-top: 4px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>持仓监控</h1>
+  <button onclick="openSettings()">设置</button>
+</header>
+
+<div class="toolbar">
+  <button class="primary" onclick="fetchData()">获取持仓</button>
+  <span id="status">就绪</span>
+</div>
+
+<table>
+  <thead><tr>
+    <th>交易对</th><th>方向</th><th class="num">持仓数量(USDT)</th><th class="num">投资回报率</th>
+  </tr></thead>
+  <tbody id="tbody">
+    <tr><td colspan="4" class="empty">点击「获取持仓」加载数据</td></tr>
+  </tbody>
+</table>
+
+<div class="mask" id="settingsMask">
+  <div class="modal">
+    <h3>API 设置</h3>
+    <input type="text" id="apiKey" placeholder="API Key" spellcheck="false">
+    <input type="password" id="apiSecret" placeholder="API Secret" spellcheck="false">
+    <div class="hint">密钥仅保存在本浏览器 localStorage</div>
+    <div class="row">
+      <button onclick="closeSettings()">取消</button>
+      <button class="primary" onclick="saveSettings()">保存</button>
+    </div>
+  </div>
+</div>
+
+<script>
+"use strict";
+const FAPI = "https://fapi.binance.com";
+const PAIRS = ["BTCUSDT","BTCUSDC","BTCUSD1","BTCU","BTC次季","BTC当季",
+  "ETHUSDT","ETHUSDC","ETHUSD1","ETHU","ETH次季","ETH当季",
+  "XAUUSDT","XAUTUSDT","PAXGUSDT"];
+const KEY_STORE = "bc_keys_v1";
+
+function loadKeys(){ try{ return JSON.parse(localStorage.getItem(KEY_STORE)||"{}"); }catch(e){ return {}; } }
+function saveKeys(k){ localStorage.setItem(KEY_STORE, JSON.stringify(k)); }
+function getKeys(){ const k=loadKeys(); return {key:k.key||"", secret:k.secret||""}; }
+
+// 时间同步
+let serverRefMs=0, serverRefPerf=0, syncOk=false;
+async function ensureOffset(){
+  if(syncOk && performance.now()-serverRefPerf<60000) return;
+  try{
+    const r = await fetch(FAPI+"/fapi/v1/time");
+    const d = await r.json();
+    if(d.serverTime>0){ serverRefMs=d.serverTime; serverRefPerf=performance.now(); syncOk=true; }
+  }catch(e){}
+}
+async function nowMs(){
+  await ensureOffset();
+  return serverRefMs>0 ? Math.round(serverRefMs+(performance.now()-serverRefPerf)) : Date.now();
+}
+
+async function hexSign(secret, msg){
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey("raw", enc.encode(secret),
+    {name:"HMAC", hash:"SHA-256"}, false, ["sign"]);
+  const sig = await crypto.subtle.sign("HMAC", key, enc.encode(msg));
+  return Array.from(new Uint8Array(sig)).map(b=>b.toString(16).padStart(2,"0")).join("");
+}
+
+async function fetchPositions(key, secret){
+  await ensureOffset();
+  const params = "timestamp="+(await nowMs())+"&recvWindow=10000";
+  const sig = await hexSign(secret, params);
+  const r = await fetch(FAPI+"/fapi/v2/positionRisk?"+params+"&signature="+sig, {
+    headers:{"X-MBX-APIKEY":key}
+  });
+  return r.json();
+}
+
+function positionInfo(p){
+  const amt = parseFloat(p.positionAmt)||0;
+  const mark = parseFloat(p.markPrice)||0;
+  const unrealized = parseFloat(p.unRealizedProfit)||0;
+  let margin = parseFloat(p.positionInitialMargin)||parseFloat(p.isolatedMargin)||parseFloat(p.initialMargin)||0;
+  if(margin<=0){
+    const notional = Math.abs(parseFloat(p.notional)||(amt*mark));
+    const lev = parseFloat(p.leverage)||0;
+    if(lev>0 && notional>0) margin = notional/lev;
+  }
+  const roi = margin>0 ? unrealized/margin*100 : 0;
+  const notional = Math.abs(amt)*mark;
+  return {amt, mark, unrealized, roi, notional};
+}
+
+async function fetchData(){
+  const {key, secret} = getKeys();
+  const tbody = document.getElementById("tbody");
+  if(!key || !secret){
+    tbody.innerHTML = '<tr><td colspan="4" class="empty">请先点「设置」填写 API Key / Secret</td></tr>';
+    openSettings();
+    return;
+  }
+  document.getElementById("status").textContent = "正在加载…";
+  try{
+    const data = await fetchPositions(key, secret);
+    if(!Array.isArray(data)) throw new Error("返回异常: "+JSON.stringify(data));
+    // 只显示列表里的交易对且有持仓的
+    const rows = [];
+    for(const p of data){
+      const amt = parseFloat(p.positionAmt)||0;
+      if(amt===0) continue;
+      if(!PAIRS.includes(p.symbol)) continue;
+      const info = positionInfo(p);
+      rows.push({symbol:p.symbol, ...info});
+    }
+    if(!rows.length){
+      tbody.innerHTML = '<tr><td colspan="4" class="empty">指定交易对无持仓</td></tr>';
+    }else{
+      tbody.innerHTML = rows.map(r=>{
+        const dirCls = r.amt>0 ? "long" : "short";
+        const dirTxt = r.amt>0 ? "多" : "空";
+        const roiCls = r.roi>=0 ? "roi-pos" : "roi-neg";
+        return '<tr>'+
+          '<td class="sym">'+r.symbol+'</td>'+
+          '<td class="'+dirCls+'">'+dirTxt+'</td>'+
+          '<td class="num">$'+r.notional.toLocaleString("en-US",{maximumFractionDigits:2})+'</td>'+
+          '<td class="num '+roiCls+'">'+(r.roi>=0?"+":"")+r.roi.toFixed(2)+'%</td>'+
+        '</tr>';
+      }).join("");
+    }
+    document.getElementById("status").textContent = "已加载 "+rows.length+" 条持仓 · "+new Date().toLocaleTimeString("zh-CN",{hour12:false});
+  }catch(e){
+    tbody.innerHTML = '<tr><td colspan="4" class="empty">加载失败: '+e.message+'</td></tr>';
+    document.getElementById("status").textContent = "失败: "+e.message;
+  }
+}
+
+function openSettings(){
+  const {key, secret} = getKeys();
+  document.getElementById("apiKey").value = key;
+  document.getElementById("apiSecret").value = secret;
+  document.getElementById("settingsMask").classList.add("show");
+}
+function closeSettings(){ document.getElementById("settingsMask").classList.remove("show"); }
+function saveSettings(){
+  saveKeys({key: document.getElementById("apiKey").value.trim(), secret: document.getElementById("apiSecret").value.trim()});
+  closeSettings();
+  fetchData();
+}
+
+// 初始化
+(function(){
+  const {key} = getKeys();
+  if(key) fetchData();
+})();
+</script>
+</body>
+</html>
