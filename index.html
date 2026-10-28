@@ -104,13 +104,12 @@
 <script>
 "use strict";
 const FAPI = "https://fapi.binance.com";
-const DAPI = "https://dapi.binance.com";
-const PAIRS = ["BTCUSDT","BTCUSDC","BTCUSD1","BTCU","BTC次季","BTC当季",
-  "ETHUSDT","ETHUSDC","ETHUSD1","ETHU","ETH次季","ETH当季",
+const PAIRS = ["BTCUSDT","BTCUSDC","BTCUSD1",
+  "ETHUSDT","ETHUSDC","ETHUSD1",
   "XAUUSDT","XAUTUSDT","PAXGUSDT"];
 const GROUPS = [
-  {label:"BTC", pairs:["BTCUSDT","BTCUSDC","BTCUSD1","BTCU","BTC次季","BTC当季"]},
-  {label:"ETH", pairs:["ETHUSDT","ETHUSDC","ETHUSD1","ETHU","ETH次季","ETH当季"]},
+  {label:"BTC", pairs:["BTCUSDT","BTCUSDC","BTCUSD1"]},
+  {label:"ETH", pairs:["ETHUSDT","ETHUSDC","ETHUSD1"]},
   {label:"黄金", pairs:["XAUUSDT","XAUTUSDT","PAXGUSDT"]},
 ];
 const KEY_STORE = "bc_keys_v1";
@@ -158,92 +157,6 @@ async function fetchPositions(key, secret){
   const sig = await hexSign(secret, params);
   return fetchJson(FAPI+"/fapi/v2/positionRisk?"+params+"&signature="+sig, 20000, key);
 }
-// Coin-M 交割合约持仓
-async function fetchDeliveryPositions(key, secret){
-  await ensureOffset();
-  const params = "timestamp="+(await nowMs())+"&recvWindow=10000";
-  const sig = await hexSign(secret, params);
-  return fetchJson(DAPI+"/dapi/v1/positionRisk?"+params+"&signature="+sig, 20000, key);
-}
-// 将交割合约symbol映射为显示名：BTCUSD_PERP→BTCU, BTCUSD_250926→BTC当季/次季
-function mapDeliverySymbol(sym){
-  if(sym.endsWith("_PERP")) return sym.replace("_PERP","U"); // BTCUSD_PERP→BTCU
-  const m = sym.match(/^([A-Z]+)USD_(\d{6})$/);
-  if(m){
-    const base = m[1];
-    const yy = m[2].substring(0,2), mm = m[2].substring(2,4), dd = m[2].substring(4,6);
-    const expiry = new Date(2000+parseInt(yy), parseInt(mm)-1, parseInt(dd));
-    const now = new Date();
-    // 找两个最近的季度合约：当季=最近到期，次季=第二个到期
-    // 这里由调用方排序后传入，直接返回原始symbol供分组
-    return sym;
-  }
-  return sym;
-}
-// 从合约代码 YYMMDD 解析到期时间（用于兜底排序）
-function expFromSym(sym){
-  const m = sym.match(/^([A-Z]+)USD_(\d{6})$/);
-  if(!m) return null;
-  const y = 2000+parseInt(m[2].slice(0,2),10);
-  const mo = parseInt(m[2].slice(2,4),10)-1;
-  const dd = parseInt(m[2].slice(4,6),10);
-  return {base: m[1], exp: new Date(y, mo, dd).getTime()};
-}
-// 兜底排序：即使交易所列表拉取失败，也按实际持仓的到期日区分当季/次季
-function rankDeliverySymbols(held){
-  const byBase = {};
-  const now = Date.now();
-  for(const it of held){
-    if(!it || !it.exp) continue;
-    if(!byBase[it.base]) byBase[it.base] = [];
-    byBase[it.base].push(it);
-  }
-  const out = {};
-  for(const base of Object.keys(byBase)){
-    const arr = byBase[base].filter(x=>x.exp>now).sort((a,b)=>a.exp-b.exp);
-    if(arr[0]) out[arr[0].sym] = base+"当季";
-    if(arr[1]) out[arr[1].sym] = base+"次季";
-  }
-  return out;
-}
-// 获取交割合约的季度合约列表，区分当季/次季（不缓存，每次重新拉取）
-async function buildDeliveryMap(){
-  try{
-    const d = await fetchJson(DAPI+"/dapi/v1/exchangeInfo", 30000);
-    const map = {};
-    const quarters = {};
-    for(const s of (d.symbols||[])){
-      const sym = s.symbol || "";
-      // 永续合约：BTCUSD_PERP → BTCU
-      if(sym.endsWith("_PERP")){
-        map[sym] = sym.replace("USD_PERP","U"); // BTCUSD_PERP → BTCU
-        continue;
-      }
-      // 季度合约：BTCUSD_250926
-      const m = sym.match(/^([A-Z]+)USD_(\d{6})$/);
-      if(m){
-        const base = m[1];
-        if(!quarters[base]) quarters[base] = [];
-        // 优先用交易所返回的交割时间；缺失时用合约代码内的日期
-        let exp = parseInt(s.deliveryDate,10)||0;
-        if(!exp){
-          const ex = expFromSym(sym);
-          exp = ex ? ex.exp : 0;
-        }
-        quarters[base].push({sym, expiry: exp});
-      }
-    }
-    for(const base of Object.keys(quarters)){
-      const list = quarters[base].sort((a,b)=>a.expiry-b.expiry);
-      if(list[0]) map[list[0].sym] = base+"当季";
-      if(list[1]) map[list[1].sym] = base+"次季";
-    }
-    return map;
-  }catch(e){
-    console.warn("buildDeliveryMap error:", e);
-    return {};
-  }
-}
 
 function positionInfo(p){
   const amt = parseFloat(p.positionAmt)||0;
@@ -270,44 +183,19 @@ async function fetchData(){
   }
   document.getElementById("status").textContent = "正在加载…";
   try{
-    // 并行获取 U本位合约 + Coin-M交割合约
-    const [data, deliveryData, delMap] = await Promise.all([
-      fetchPositions(key, secret),
-      fetchDeliveryPositions(key, secret),
-      buildDeliveryMap()
-    ]);
-    let warnMsg = "";
-    let deliveryOk = Array.isArray(deliveryData);
-    if(!deliveryOk){
-      let code="", msg="";
-      if(deliveryData && typeof deliveryData==="object"){ code=deliveryData.code; msg=deliveryData.msg||""; }
-      warnMsg = "交割合约读取失败";
-      if(code) warnMsg += "（code "+code+(msg?" "+msg:"")+"）";
-      if(String(code)==="-2015" || /permission/i.test(msg)){
-        warnMsg += " —— 请到币安「API 管理」确认该 API Key 已勾选合约权限且包含币本位(交割)合约，保存后重新获取";
-      }else if(!msg){
-        warnMsg += " —— 接口超时或网络不通";
-      }
-    }
-    // debug: 显示两边的非零持仓
-    let nzFapi = [], nzDapi = [];
+    const data = await fetchPositions(key, secret);
+    // debug: 显示 U本位非零持仓
+    let nzFapi = [];
     if(Array.isArray(data)){
       for(const p of data){
         if(parseFloat(p.positionAmt)!==0) nzFapi.push({sym:p.symbol, side:p.positionSide, amt:p.positionAmt});
       }
     }
-    if(Array.isArray(deliveryData)){
-      for(const p of deliveryData){
-        if(parseFloat(p.positionAmt)!==0) nzDapi.push({sym:p.symbol, side:p.positionSide, amt:p.positionAmt});
-      }
-    }
     let debugHtml = '<div style="margin:10px 16px;padding:10px;background:#1a0a0a;border:1px solid #ef4444;border-radius:6px;font-family:Consolas,monospace;font-size:11px;color:#ff8888;max-height:300px;overflow:auto">';
     debugHtml += "<b>U本位非零持仓:</b> " + JSON.stringify(nzFapi);
-    debugHtml += "<br><b>交割合约非零持仓:</b> " + JSON.stringify(nzDapi);
     debugHtml += "</div>";
     // 按显示名分组收集持仓
     const posMap = {};
-    // U本位持仓
     if(Array.isArray(data)){
       for(const p of data){
         const amt = parseFloat(p.positionAmt)||0;
@@ -316,27 +204,6 @@ async function fetchData(){
         if(!posMap[p.symbol]) posMap[p.symbol] = [];
         posMap[p.symbol].push(p);
       }
-    }
-    // 交割合约持仓：symbol映射为显示名（交易所季度表 → 实际持仓兜底排序 → 原始名兜底）
-    if(Array.isArray(deliveryData)){
-      const heldList = [];
-      for(const p of deliveryData){
-        const amt = parseFloat(p.positionAmt)||0;
-        if(amt===0) continue;
-        const ex = expFromSym(p.symbol);
-        if(ex) heldList.push({sym:p.symbol, base:ex.base, exp:ex.exp});
-      }
-      const heldMap = rankDeliverySymbols(heldList);
-      const unknown = [];
-      for(const p of deliveryData){
-        const amt = parseFloat(p.positionAmt)||0;
-        if(amt===0) continue;
-        const displayName = delMap[p.symbol] || heldMap[p.symbol] || p.symbol;
-        if(!PAIRS.includes(displayName)){ unknown.push(p.symbol); continue; }
-        if(!posMap[displayName]) posMap[displayName] = [];
-        posMap[displayName].push(p);
-      }
-      if(unknown.length) warnMsg += (warnMsg?"；":"") + "未识别的交割合约: "+unknown.join(", ");
     }
     let html = "";
     let totalPos = 0;
@@ -383,7 +250,7 @@ async function fetchData(){
       html += '</div>';
     }
     container.innerHTML = debugHtml + html;
-    document.getElementById("status").textContent = "已加载 "+totalPos+" 条持仓 / 共 "+PAIRS.length+" 个交易对 · "+(deliveryOk?"交割合约正常":"交割合约失败")+" · "+new Date().toLocaleTimeString("zh-CN",{hour12:false})+(warnMsg?" · ⚠ "+warnMsg:"");
+    document.getElementById("status").textContent = "已加载 "+totalPos+" 条持仓 / 共 "+PAIRS.length+" 个交易对 · "+new Date().toLocaleTimeString("zh-CN",{hour12:false});
   }catch(e){
     container.innerHTML = '<div class="empty">加载失败: '+e.message+'</div>';
     document.getElementById("status").textContent = "失败: "+e.message;
