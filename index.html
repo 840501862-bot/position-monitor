@@ -26,18 +26,28 @@
   button:hover { border-color: #2f8cff; color: #cfe3ff; }
   button.primary { background: linear-gradient(180deg,#1e7bff,#1460e0); border-color: #2f8cff; color: #fff; }
   #status { color: #4dc3ff; font-size: 12px; }
-  table { width: 100%; border-collapse: collapse; margin-top: 8px; }
-  thead th {
-    background: #1a3a6e; color: #8fa8c4; padding: 10px 12px; text-align: left;
-    border-bottom: 1px solid #2c5aa8; white-space: nowrap;
+  .groups { padding: 10px 16px; }
+  .group-label {
+    font-size: 13px; font-weight: 700; color: #c9ddf5;
+    background: #1a3a6e; padding: 6px 12px; border-radius: 6px 6px 0 0;
+    border: 1px solid #2c5aa8; border-bottom: none;
   }
-  tbody td { padding: 10px 12px; border-bottom: 1px solid #2E6FBF; white-space: nowrap; }
-  tbody tr:nth-child(even) { background: rgba(58,123,213,.08); }
-  tbody tr:hover { background: rgba(58,123,213,.18); }
-  .sym { font-weight: 700; color: #fff; }
+  .cards {
+    display: flex; flex-wrap: wrap; gap: 8px;
+    border: 1px solid #2c5aa8; border-radius: 0 6px 6px 6px;
+    padding: 10px; background: rgba(20,35,74,.4);
+  }
+  .card {
+    min-width: 150px; background: #142543; border: 1px solid #2a4d7f;
+    border-radius: 6px; padding: 10px 12px;
+  }
+  .card .c-sym { font-weight: 700; color: #fff; font-size: 14px; margin-bottom: 6px; }
+  .card .c-row { display: flex; justify-content: space-between; font-size: 12px; line-height: 1.8; }
+  .card .c-row .lbl { color: #7d93ab; }
+  .card .c-empty { color: #5f7d9e; font-size: 12px; padding: 8px 0; text-align: center; }
   .long { color: #ef4444; font-weight: 700; }
   .short { color: #22c55e; font-weight: 700; }
-  .num { font-family: Consolas, monospace; text-align: right; }
+  .num { font-family: Consolas, monospace; }
   .roi-pos { color: #ef4444; font-weight: 700; }
   .roi-neg { color: #22c55e; font-weight: 700; }
   .empty { text-align: center; padding: 40px; color: #5f7d9e; }
@@ -73,14 +83,9 @@
   <span id="status">就绪</span>
 </div>
 
-<table>
-  <thead><tr>
-    <th>交易对</th><th>方向</th><th class="num">持仓数量(USDT)</th><th class="num">投资回报率</th>
-  </tr></thead>
-  <tbody id="tbody">
-    <tr><td colspan="4" class="empty">点击「获取持仓」加载数据</td></tr>
-  </tbody>
-</table>
+<div class="groups" id="groups">
+  <div class="empty">点击「获取持仓」加载数据</div>
+</div>
 
 <div class="mask" id="settingsMask">
   <div class="modal">
@@ -162,9 +167,9 @@ function positionInfo(p){
 
 async function fetchData(){
   const {key, secret} = getKeys();
-  const tbody = document.getElementById("tbody");
+  const container = document.getElementById("groups");
   if(!key || !secret){
-    tbody.innerHTML = '<tr><td colspan="4" class="empty">请先点「设置」填写 API Key / Secret</td></tr>';
+    container.innerHTML = '<div class="empty">请先点「设置」填写 API Key / Secret</div>';
     openSettings();
     return;
   }
@@ -172,6 +177,7 @@ async function fetchData(){
   try{
     const data = await fetchPositions(key, secret);
     if(!Array.isArray(data)) throw new Error("返回异常: "+JSON.stringify(data));
+    // 按交易对分组收集持仓
     const posMap = {};
     for(const p of data){
       const amt = parseFloat(p.positionAmt)||0;
@@ -183,13 +189,12 @@ async function fetchData(){
     let html = "";
     let totalPos = 0;
     for(const g of GROUPS){
-      html += '<tr style="background:#1a3a6e;font-weight:700;color:#c9ddf5"><td colspan="4" style="padding:6px 12px">'+g.label+'</td></tr>';
+      html += '<div class="group-label">'+g.label+'</div>';
+      html += '<div class="cards">';
       for(const sym of g.pairs){
         const positions = posMap[sym] || [];
         if(!positions.length){
-          html += '<tr style="opacity:.45">'+
-            '<td class="sym">'+sym+'</td>'+
-            '<td>-</td><td class="num">-</td><td class="num">-</td></tr>';
+          html += '<div class="card"><div class="c-sym">'+sym+'</div><div class="c-empty">无持仓</div></div>';
           continue;
         }
         for(const p of positions){
@@ -202,19 +207,20 @@ async function fetchData(){
           const roiCls = info.roi>=0 ? "roi-pos" : "roi-neg";
           const roiTxt = (info.roi>=0?"+":"")+info.roi.toFixed(2)+"%";
           const notionalTxt = "$"+info.notional.toLocaleString("en-US",{maximumFractionDigits:2});
-          html += '<tr>'+
-            '<td class="sym">'+sym+'</td>'+
-            '<td class="'+dirCls+'">'+dirTxt+'</td>'+
-            '<td class="num">'+notionalTxt+'</td>'+
-            '<td class="num '+roiCls+'">'+roiTxt+'</td>'+
-          '</tr>';
+          html += '<div class="card">'+
+            '<div class="c-sym">'+sym+'</div>'+
+            '<div class="c-row"><span class="lbl">方向</span><span class="'+dirCls+'">'+dirTxt+'</span></div>'+
+            '<div class="c-row"><span class="lbl">数量</span><span class="num">'+notionalTxt+'</span></div>'+
+            '<div class="c-row"><span class="lbl">回报率</span><span class="num '+roiCls+'">'+roiTxt+'</span></div>'+
+          '</div>';
         }
       }
+      html += '</div>';
     }
-    tbody.innerHTML = html;
+    container.innerHTML = html;
     document.getElementById("status").textContent = "已加载 "+totalPos+" 条持仓 / 共 "+PAIRS.length+" 个交易对 · "+new Date().toLocaleTimeString("zh-CN",{hour12:false});
   }catch(e){
-    tbody.innerHTML = '<tr><td colspan="4" class="empty">加载失败: '+e.message+'</td></tr>';
+    container.innerHTML = '<div class="empty">加载失败: '+e.message+'</div>';
     document.getElementById("status").textContent = "失败: "+e.message;
   }
 }
