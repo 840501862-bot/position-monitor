@@ -361,9 +361,19 @@ async function fetchData(){
     for(const g of GROUPS){
       html += '<div class="group-label">'+g.label+'</div>';
       html += '<div class="cards">';
-      // 先排所有多单，再排所有空单（中间强制换行）
-      for(const dir of ["LONG","SHORT"]){
-        if(dir==="SHORT") html += '<div class="break"></div>';
+      // 同一币种下：所有交易对的多单持仓数量求和 vs 空单持仓数量求和，谁的数量大谁排在前面
+      let longTotal = 0, shortTotal = 0;
+      for(const sym of g.pairs){
+        for(const p of (posMap[sym]||[])){
+          const amt = parseFloat(p.positionAmt)||0;
+          if(amt===0) continue;
+          const side = p.positionSide || (amt>0 ? "LONG" : "SHORT");
+          if(side==="SHORT") shortTotal += Math.abs(amt); else longTotal += Math.abs(amt);
+        }
+      }
+      const dirs = longTotal >= shortTotal ? ["LONG","SHORT"] : ["SHORT","LONG"];
+      for(const dir of dirs){
+        if(dir!==dirs[0]) html += '<div class="break"></div>';
         for(const sym of g.pairs){
           const positions = (posMap[sym] || []).filter(p=>{
             const side = p.positionSide || "";
