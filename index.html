@@ -194,7 +194,12 @@ async function fetchData(){
       for(const sym of g.pairs){
         const positions = posMap[sym] || [];
         if(!positions.length){
-          html += '<div class="card"><div class="c-sym">'+sym+'</div><div class="c-empty">无持仓</div></div>';
+          html += '<div class="card" style="opacity:.5">'+
+            '<div class="c-sym">'+sym+'</div>'+
+            '<div class="c-row"><span class="lbl">方向</span><span>-</span></div>'+
+            '<div class="c-row"><span class="lbl">数量</span><span class="num">-</span></div>'+
+            '<div class="c-row"><span class="lbl">回报率</span><span class="num">-</span></div>'+
+          '</div>';
           continue;
         }
         for(const p of positions){
