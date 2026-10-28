@@ -241,7 +241,10 @@ async function fetchData(){
       fetchDeliveryPositions(key, secret),
       buildDeliveryMap()
     ]);
-    console.log("U本位持仓:", Array.isArray(data)?data.length:data, "交割持仓:", Array.isArray(deliveryData)?deliveryData.length:deliveryData, "合约映射:", delMap);
+    let warnMsg = "";
+    if(!Array.isArray(deliveryData)){
+      warnMsg = "交割合约接口异常: " + JSON.stringify(deliveryData).substring(0,120);
+    }
     // 按显示名分组收集持仓
     const posMap = {};
     // U本位持仓
@@ -260,13 +263,10 @@ async function fetchData(){
         const amt = parseFloat(p.positionAmt)||0;
         if(amt===0) continue;
         const displayName = delMap[p.symbol] || p.symbol;
-        console.log("交割持仓:", p.symbol, "→", displayName, "amt:", amt);
         if(!PAIRS.includes(displayName)) continue;
         if(!posMap[displayName]) posMap[displayName] = [];
         posMap[displayName].push(p);
       }
-    } else {
-      console.warn("交割合约返回异常:", deliveryData);
     }
     let html = "";
     let totalPos = 0;
@@ -313,7 +313,7 @@ async function fetchData(){
       html += '</div>';
     }
     container.innerHTML = html;
-    document.getElementById("status").textContent = "已加载 "+totalPos+" 条持仓 / 共 "+PAIRS.length+" 个交易对 · "+new Date().toLocaleTimeString("zh-CN",{hour12:false});
+    document.getElementById("status").textContent = "已加载 "+totalPos+" 条持仓 / 共 "+PAIRS.length+" 个交易对 · "+new Date().toLocaleTimeString("zh-CN",{hour12:false})+(warnMsg?" · ⚠ "+warnMsg:"");
   }catch(e){
     container.innerHTML = '<div class="empty">加载失败: '+e.message+'</div>';
     document.getElementById("status").textContent = "失败: "+e.message;
