@@ -176,39 +176,36 @@ function mapDeliverySymbol(sym){
   }
   return sym;
 }
-// 获取交割合约的季度合约列表，区分当季/次季
-let deliveryContractMap = null; // {displayName: actualSymbol}
+// 获取交割合约的季度合约列表，区分当季/次季（不缓存，每次重新拉取）
 async function buildDeliveryMap(){
-  if(deliveryContractMap) return deliveryContractMap;
   try{
     const r = await fetch(DAPI+"/dapi/v1/exchangeInfo");
     const d = await r.json();
     const map = {};
-    const quarters = {BTC:[], ETH:[]};
+    const quarters = {};
     for(const s of (d.symbols||[])){
-      if(s.contractType === "PERPETUAL"){
-        // BTCUSD_PERP → BTCU
-        const display = s.symbol.replace("_PERP","U");
-        map[s.symbol] = display;
-      } else if(s.contractType === "CURRENT_QUARTER" || s.contractType === "NEXT_QUARTER"){
-        const m = s.symbol.match(/^([A-Z]+)USD_(\d{6})$/);
-        if(m){
-          const base = m[1];
-          if(!quarters[base]) quarters[base] = [];
-          quarters[base].push({sym: s.symbol, expiry: s.deliveryDate, type: s.contractType});
-        }
+      const sym = s.symbol || "";
+      // 永续合约：BTCUSD_PERP → BTCU
+      if(sym.endsWith("_PERP")){
+        map[sym] = sym.replace("_PERP","U");
+        continue;
+      }
+      // 季度合约：BTCUSD_250926
+      const m = sym.match(/^([A-Z]+)USD_(\d{6})$/);
+      if(m){
+        const base = m[1];
+        if(!quarters[base]) quarters[base] = [];
+        quarters[base].push({sym, expiry: s.deliveryDate || s.onboardDate || 0});
       }
     }
-    // 对每个base，按到期日排序，最早=当季，次早=次季
     for(const base of Object.keys(quarters)){
       const list = quarters[base].sort((a,b)=>a.expiry-b.expiry);
       if(list[0]) map[list[0].sym] = base+"当季";
       if(list[1]) map[list[1].sym] = base+"次季";
     }
-    deliveryContractMap = map;
     return map;
   }catch(e){
-    deliveryContractMap = {};
+    console.warn("buildDeliveryMap error:", e);
     return {};
   }
 }
@@ -241,9 +238,10 @@ async function fetchData(){
     // 并行获取 U本位合约 + Coin-M交割合约
     const [data, deliveryData, delMap] = await Promise.all([
       fetchPositions(key, secret),
-      fetchDeliveryPositions(key, secret).catch(()=>[]),
+      fetchDeliveryPositions(key, secret),
       buildDeliveryMap()
     ]);
+    console.log("U本位持仓:", Array.isArray(data)?data.length:data, "交割持仓:", Array.isArray(deliveryData)?deliveryData.length:deliveryData, "合约映射:", delMap);
     // 按显示名分组收集持仓
     const posMap = {};
     // U本位持仓
@@ -262,10 +260,13 @@ async function fetchData(){
         const amt = parseFloat(p.positionAmt)||0;
         if(amt===0) continue;
         const displayName = delMap[p.symbol] || p.symbol;
+        console.log("交割持仓:", p.symbol, "→", displayName, "amt:", amt);
         if(!PAIRS.includes(displayName)) continue;
         if(!posMap[displayName]) posMap[displayName] = [];
         posMap[displayName].push(p);
       }
+    } else {
+      console.warn("交割合约返回异常:", deliveryData);
     }
     let html = "";
     let totalPos = 0;
