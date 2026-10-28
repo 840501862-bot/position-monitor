@@ -70,6 +70,14 @@
   .modal input:focus { border-color: #2f8cff; }
   .modal .row { display: flex; gap: 8px; margin-top: 12px; justify-content: flex-end; }
   .modal .hint { color: #5f7d9e; font-size: 11px; margin-top: 4px; }
+  /* 手机/窄屏：每行4张卡固定在同一行不往下跑（弹性均分宽度） */
+  @media (max-width: 720px){
+    .cards { gap: 6px; padding: 8px; }
+    .card { flex: 1 1 0; min-width: 0; width: auto; padding: 8px 6px; }
+    .card .c-sym { font-size: 12px; margin-bottom: 4px; }
+    .card .c-row { font-size: 11px; line-height: 1.7; }
+    .card button { font-size: 11px; padding: 2px 0; margin-top: 4px; }
+  }
 </style>
 </head>
 <body>
