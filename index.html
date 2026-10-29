@@ -138,7 +138,11 @@ async function ensureDeliveryPairs(){
       const ct = s.contractType || "";
       if(ct!=="CURRENT_QUARTER" && ct!=="NEXT_QUARTER") continue;
       if(s.baseAsset!=="BTC" && s.baseAsset!=="ETH") continue;
-      out[s.baseAsset].push({display:s.baseAsset+(ct==="CURRENT_QUARTER"?"当季":"次季"), symbol:s.symbol});
+      out[s.baseAsset].push({display:s.baseAsset+(ct==="CURRENT_QUARTER"?"当季":"次季"), symbol:s.symbol, ct});
+    }
+    // 排序：次季在前、当季在后
+    for(const k of Object.keys(out)){
+      out[k].sort((a,b)=> a.ct===b.ct ? 0 : (a.ct==="NEXT_QUARTER" ? -1 : 1));
     }
     DELIV = out;
   }catch(e){ /* 识别失败则不显示交割卡 */ }
