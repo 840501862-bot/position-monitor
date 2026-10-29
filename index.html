@@ -74,7 +74,7 @@
   .modal .hint { color: #5f7d9e; font-size: 11px; margin-top: 4px; }
   /* 手机/窄屏：每行4张卡固定在同一行不往下跑（4列均分） */
   @media (max-width: 720px){
-    .cards { grid-template-columns: repeat(4, 1fr); gap: 6px; padding: 8px; }
+    .cards { gap: 6px; padding: 8px; }
     .card { padding: 8px 6px; }
     .card .c-sym { font-size: 12px; margin-bottom: 4px; }
     .card .c-row { grid-template-columns: 36px minmax(0,1fr); gap: 4px; font-size: 11px; line-height: 1.7; }
@@ -401,7 +401,6 @@ async function fetchData(){
         }
       }
       html += '<div class="group-label">'+g.label+'</div>';
-      html += '<div class="cards">';
       // 同一币种下：所有交易对的多单持仓数量求和 vs 空单持仓数量求和，谁的数量大谁排在前面
       let longTotal = 0, shortTotal = 0;
       for(const it of ordered){
@@ -413,8 +412,9 @@ async function fetchData(){
         }
       }
       const dirs = longTotal >= shortTotal ? ["LONG","SHORT"] : ["SHORT","LONG"];
+      // 同一方向的块固定在同一行：按该方向实际块数均分列宽
       for(const dir of dirs){
-        if(dir!==dirs[0]) html += '<div class="break"></div>';
+        let blocks = "", blockCount = 0;
         for(const it of ordered){
           const sym = it.sym;
           const display = it.type==="deliv" ? it.display : sym;
@@ -425,13 +425,14 @@ async function fetchData(){
             return side==="SHORT" || (side!=="LONG" && amt<0);
           });
           if(!positions.length){
-            html += '<div class="card" style="opacity:.5">'+
+            blocks += '<div class="card" style="opacity:.5">'+
               '<div class="c-sym">'+display+'</div>'+
               '<div class="c-row"><span class="lbl">方向</span><span>'+(dir==="LONG"?"多":"空")+'</span></div>'+
               '<div class="c-row"><span class="lbl">数量</span><span class="num">-</span></div>'+
               '<div class="c-row"><span class="lbl">回报率</span><span class="num">-</span></div>'+
               '<button onclick="tradePair(\''+display+'\')" style="width:100%;margin-top:6px;padding:3px 0;font-size:12px">加仓</button>'+
             '</div>';
+            blockCount++;
             continue;
           }
           for(const p of positions){
@@ -443,17 +444,18 @@ async function fetchData(){
             const roiCls = info.roi>=0 ? "roi-pos" : "roi-neg";
             const roiTxt = (info.roi>=0?"+":"")+info.roi.toFixed(2)+"%";
             const notionalTxt = "$"+info.notional.toLocaleString("en-US",{maximumFractionDigits:2});
-            html += '<div class="card">'+
+            blocks += '<div class="card">'+
               '<div class="c-sym">'+display+'</div>'+
               '<div class="c-row"><span class="lbl">方向</span><span class="'+dirCls+'">'+dirTxt+'</span></div>'+
               '<div class="c-row"><span class="lbl">数量</span><span class="num">'+notionalTxt+'</span></div>'+
               '<div class="c-row"><span class="lbl">回报率</span><span class="num '+roiCls+'">'+roiTxt+'</span></div>'+
               '<button onclick="tradePair(\''+display+'\')" style="width:100%;margin-top:6px;padding:3px 0;font-size:12px">加仓</button>'+
             '</div>';
+            blockCount++;
           }
         }
+        html += '<div class="cards" style="grid-template-columns:repeat('+blockCount+',1fr)">'+blocks+'</div>';
       }
-      html += '</div>';
     }
     container.innerHTML = html;
     const totalPairs = PAIRS.length + DELIV.BTC.length + DELIV.ETH.length;
