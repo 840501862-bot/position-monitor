@@ -104,6 +104,7 @@
 </header>
 
 <div class="toolbar">
+  <select id="accSel" onchange="onAccSwitch()" style="max-width:200px;padding:6px 8px;border:1px solid #2b4a6e;border-radius:4px;background:#0e1b33;color:#d5dee8;font-size:13px;outline:none"></select>
   <button class="primary" onclick="fetchData()">获取持仓</button>
   <span id="status">就绪</span>
 </div>
@@ -380,7 +381,7 @@ function positionInfo(p){
   return {amt, mark, unrealized, roi, notional};
 }
 
-async function fetchData(){
+async function fetchData(accId){
   const accs = getAccounts();
   const container = document.getElementById("groups");
   if(!accs.length){
@@ -388,122 +389,132 @@ async function fetchData(){
     openSettings();
     return;
   }
-  document.getElementById("status").textContent = "正在加载…";
+  const acc = accs.find(a=>a.id===accId) || accs[0];
+  const sel = document.getElementById("accSel");
+  if(sel && String(sel.value) !== String(acc.id)) sel.value = String(acc.id);
+  document.getElementById("status").textContent = "正在加载 "+acc.name+" …";
   try{
     await ensureDeliveryPairs();
-    // 每个账户并行拉取 U本位 + Coin-M 持仓
-    const accResults = await Promise.all(accs.map(async acc=>{
-      try{
-        const [data, deliveryData] = await Promise.all([
-          fetchPositions(acc.key, acc.secret),
-          fetchDeliveryPositions(acc.key, acc.secret)
-        ]);
-        const posMap = {};
-        // U本位持仓（含当季/次季交割合约，全量收集，渲染时按需取）
-        if(Array.isArray(data)){
-          for(const p of data){
-            const amt = parseFloat(p.positionAmt)||0;
-            if(amt===0) continue;
-            if(!posMap[p.symbol]) posMap[p.symbol] = [];
-            posMap[p.symbol].push(p);
-          }
-        }
-        // Coin-M 永续持仓：BTCUSD_PERP→BTCU, ETHUSD_PERP→ETHU（季度交割合约不展示）
-        if(Array.isArray(deliveryData)){
-          for(const p of deliveryData){
-            const amt = parseFloat(p.positionAmt)||0;
-            if(amt===0) continue;
-            const name = deliveryDisplayName(p.symbol);
-            if(!name) continue;
-            if(!posMap[name]) posMap[name] = [];
-            posMap[name].push(p);
-          }
-        }
-        return {acc, posMap, err:null};
-      }catch(e){ return {acc, posMap:{}, err:e.message}; }
-    }));
-
+    const [data, deliveryData] = await Promise.all([
+      fetchPositions(acc.key, acc.secret),
+      fetchDeliveryPositions(acc.key, acc.secret)
+    ]);
+    const posMap = {};
+    // U本位持仓（含当季/次季交割合约，全量收集，渲染时按需取）
+    if(Array.isArray(data)){
+      for(const p of data){
+        const amt = parseFloat(p.positionAmt)||0;
+        if(amt===0) continue;
+        if(!posMap[p.symbol]) posMap[p.symbol] = [];
+        posMap[p.symbol].push(p);
+      }
+    }
+    // Coin-M 永续持仓：BTCUSD_PERP→BTCU, ETHUSD_PERP→ETHU（季度交割合约不展示）
+    if(Array.isArray(deliveryData)){
+      for(const p of deliveryData){
+        const amt = parseFloat(p.positionAmt)||0;
+        if(amt===0) continue;
+        const name = deliveryDisplayName(p.symbol);
+        if(!name) continue;
+        if(!posMap[name]) posMap[name] = [];
+        posMap[name].push(p);
+      }
+    }
     let html = "";
     let totalPos = 0;
-    for(const r of accResults){
-      const posMap = r.posMap;
-      html += '<div class="group-label">'+esc(r.acc.name)+
-        (r.err ? ' <span style="color:#ff5470;font-weight:400;font-size:12px">✗ '+esc(r.err)+'</span>'
-               : ' <span style="color:#3ddc97;font-weight:400;font-size:12px">✓ OK</span>')+'</div>';
-      for(const g of GROUPS){
-        // 渲染顺序：本组交易对 + 紧跟 BTCU/ETHU 的当季/次季交割合约卡
-        const ordered = [];
-        for(const sym of g.pairs){
-          ordered.push({type:"pair", sym});
-          if((g.label==="BTC" && sym==="BTCU") || (g.label==="ETH" && sym==="ETHU")){
-            for(const d of (DELIV[g.label]||[])) ordered.push({type:"deliv", display:d.display, sym:d.symbol});
-          }
+    for(const g of GROUPS){
+      // 渲染顺序：本组交易对 + 紧跟 BTCU/ETHU 的当季/次季交割合约卡
+      const ordered = [];
+      for(const sym of g.pairs){
+        ordered.push({type:"pair", sym});
+        if((g.label==="BTC" && sym==="BTCU") || (g.label==="ETH" && sym==="ETHU")){
+          for(const d of (DELIV[g.label]||[])) ordered.push({type:"deliv", display:d.display, sym:d.symbol});
         }
-        html += '<div class="group-label sub">'+g.label+'</div>';
-        // 同一币种下：所有交易对的多单持仓数量求和 vs 空单持仓数量求和，谁的数量大谁排在前面
-        let longTotal = 0, shortTotal = 0;
+      }
+      html += '<div class="group-label">'+g.label+'</div>';
+      // 同一币种下：所有交易对的多单持仓数量求和 vs 空单持仓数量求和，谁的数量大谁排在前面
+      let longTotal = 0, shortTotal = 0;
+      for(const it of ordered){
+        for(const p of (posMap[it.sym]||[])){
+          const amt = parseFloat(p.positionAmt)||0;
+          if(amt===0) continue;
+          const side = p.positionSide || (amt>0 ? "LONG" : "SHORT");
+          if(side==="SHORT") shortTotal += Math.abs(amt); else longTotal += Math.abs(amt);
+        }
+      }
+      const dirs = longTotal >= shortTotal ? ["LONG","SHORT"] : ["SHORT","LONG"];
+      // 同一方向的块固定在同一行：按该方向实际块数均分列宽
+      for(const dir of dirs){
+        let blocks = "", blockCount = 0;
         for(const it of ordered){
-          for(const p of (posMap[it.sym]||[])){
+          const sym = it.sym;
+          const display = it.type==="deliv" ? it.display : sym;
+          const positions = (posMap[sym] || []).filter(p=>{
+            const side = p.positionSide || "";
             const amt = parseFloat(p.positionAmt)||0;
-            if(amt===0) continue;
-            const side = p.positionSide || (amt>0 ? "LONG" : "SHORT");
-            if(side==="SHORT") shortTotal += Math.abs(amt); else longTotal += Math.abs(amt);
+            if(dir==="LONG") return side==="LONG" || (side!=="SHORT" && amt>0);
+            return side==="SHORT" || (side!=="LONG" && amt<0);
+          });
+          if(!positions.length){
+            blocks += '<div class="card" style="opacity:.5">'+
+              '<div class="c-sym">'+display+'</div>'+
+              '<div class="c-row"><span class="lbl">方向</span><span>'+(dir==="LONG"?"多":"空")+'</span></div>'+
+              '<div class="c-row"><span class="lbl">数量</span><span class="num">-</span></div>'+
+              '<div class="c-row"><span class="lbl">回报率</span><span class="num">-</span></div>'+
+              '<button onclick="tradePair(\''+display+'\','+acc.id+')" style="width:100%;margin-top:6px;padding:3px 0;font-size:12px">加仓</button>'+
+            '</div>';
+            blockCount++;
+            continue;
+          }
+          for(const p of positions){
+            const info = positionInfo(p);
+            totalPos++;
+            const isLong = dir==="LONG";
+            const dirCls = isLong ? "long" : "short";
+            const dirTxt = isLong ? "多" : "空";
+            const roiCls = info.roi>=0 ? "roi-pos" : "roi-neg";
+            const roiTxt = (info.roi>=0?"+":"")+info.roi.toFixed(2)+"%";
+            const notionalTxt = "$"+info.notional.toLocaleString("en-US",{maximumFractionDigits:2});
+            blocks += '<div class="card">'+
+              '<div class="c-sym">'+display+'</div>'+
+              '<div class="c-row"><span class="lbl">方向</span><span class="'+dirCls+'">'+dirTxt+'</span></div>'+
+              '<div class="c-row"><span class="lbl">数量</span><span class="num">'+notionalTxt+'</span></div>'+
+              '<div class="c-row"><span class="lbl">回报率</span><span class="num '+roiCls+'">'+roiTxt+'</span></div>'+
+              '<button onclick="tradePair(\''+display+'\','+acc.id+')" style="width:100%;margin-top:6px;padding:3px 0;font-size:12px">加仓</button>'+
+            '</div>';
+            blockCount++;
           }
         }
-        const dirs = longTotal >= shortTotal ? ["LONG","SHORT"] : ["SHORT","LONG"];
-        // 同一方向的块固定在同一行：按该方向实际块数均分列宽
-        for(const dir of dirs){
-          let blocks = "", blockCount = 0;
-          for(const it of ordered){
-            const sym = it.sym;
-            const display = it.type==="deliv" ? it.display : sym;
-            const positions = (posMap[sym] || []).filter(p=>{
-              const side = p.positionSide || "";
-              const amt = parseFloat(p.positionAmt)||0;
-              if(dir==="LONG") return side==="LONG" || (side!=="SHORT" && amt>0);
-              return side==="SHORT" || (side!=="LONG" && amt<0);
-            });
-            if(!positions.length){
-              blocks += '<div class="card" style="opacity:.5">'+
-                '<div class="c-sym">'+display+'</div>'+
-                '<div class="c-row"><span class="lbl">方向</span><span>'+(dir==="LONG"?"多":"空")+'</span></div>'+
-                '<div class="c-row"><span class="lbl">数量</span><span class="num">-</span></div>'+
-                '<div class="c-row"><span class="lbl">回报率</span><span class="num">-</span></div>'+
-                '<button onclick="tradePair(\''+display+'\','+r.acc.id+')" style="width:100%;margin-top:6px;padding:3px 0;font-size:12px">加仓</button>'+
-              '</div>';
-              blockCount++;
-              continue;
-            }
-            for(const p of positions){
-              const info = positionInfo(p);
-              totalPos++;
-              const isLong = dir==="LONG";
-              const dirCls = isLong ? "long" : "short";
-              const dirTxt = isLong ? "多" : "空";
-              const roiCls = info.roi>=0 ? "roi-pos" : "roi-neg";
-              const roiTxt = (info.roi>=0?"+":"")+info.roi.toFixed(2)+"%";
-              const notionalTxt = "$"+info.notional.toLocaleString("en-US",{maximumFractionDigits:2});
-              blocks += '<div class="card">'+
-                '<div class="c-sym">'+display+'</div>'+
-                '<div class="c-row"><span class="lbl">方向</span><span class="'+dirCls+'">'+dirTxt+'</span></div>'+
-                '<div class="c-row"><span class="lbl">数量</span><span class="num">'+notionalTxt+'</span></div>'+
-                '<div class="c-row"><span class="lbl">回报率</span><span class="num '+roiCls+'">'+roiTxt+'</span></div>'+
-                '<button onclick="tradePair(\''+display+'\','+r.acc.id+')" style="width:100%;margin-top:6px;padding:3px 0;font-size:12px">加仓</button>'+
-              '</div>';
-              blockCount++;
-            }
-          }
-          html += '<div class="cards" style="grid-template-columns:repeat('+blockCount+',1fr)">'+blocks+'</div>';
-        }
+        html += '<div class="cards" style="grid-template-columns:repeat('+blockCount+',1fr)">'+blocks+'</div>';
       }
     }
     container.innerHTML = html;
     const totalPairs = PAIRS.length + DELIV.BTC.length + DELIV.ETH.length;
-    document.getElementById("status").textContent = accs.length+" 个账户 · 已加载 "+totalPos+" 条持仓 / 共 "+totalPairs+" 个交易对 · "+new Date().toLocaleTimeString("zh-CN",{hour12:false});
+    document.getElementById("status").textContent = acc.name+" · 已加载 "+totalPos+" 条持仓 / 共 "+totalPairs+" 个交易对 · "+new Date().toLocaleTimeString("zh-CN",{hour12:false});
   }catch(e){
     container.innerHTML = '<div class="empty">加载失败: '+e.message+'</div>';
     document.getElementById("status").textContent = "失败: "+e.message;
   }
+}
+
+// 账户下拉框：列出全部账户，切换即重新加载该账户持仓
+function buildAccSel(){
+  const sel = document.getElementById("accSel");
+  if(!sel) return;
+  const accs = getAccounts();
+  const cur = sel.value;
+  sel.innerHTML = "";
+  accs.forEach(a=>{
+    const o = document.createElement("option");
+    o.value = String(a.id);
+    o.textContent = a.name;
+    sel.appendChild(o);
+  });
+  if(cur && accs.some(a=>String(a.id)===cur)) sel.value = cur;
+}
+function onAccSwitch(){
+  const sel = document.getElementById("accSel");
+  fetchData(sel ? parseInt(sel.value, 10) : undefined);
 }
 
 function rowHtml(nm,key,secret){
@@ -537,12 +548,13 @@ function saveSettings(){
   if(!accs.length){ alert("请至少填写一行 API Key + Secret"); return; }
   saveKeys(accs);
   closeSettings();
+  buildAccSel();
   fetchData();
 }
 
 // 初始化
 (function(){
-  if(getAccounts().length) fetchData();
+  if(getAccounts().length){ buildAccSel(); fetchData(); }
 })();
 </script>
 </body>
