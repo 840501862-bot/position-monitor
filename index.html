@@ -74,7 +74,9 @@
   .modal .hint { color: #5f7d9e; font-size: 11px; margin-top: 4px; }
   /* 手机/窄屏：每行4张卡固定在同一行不往下跑（4列均分） */
   @media (max-width: 720px){
-    .cards { gap: 6px; padding: 8px; }
+    /* 手机端：同一方向块保持一行，块加大固定宽度，超出部分横向滑动查看 */
+    .cards { display: flex; overflow-x: auto; -webkit-overflow-scrolling: touch; gap: 8px; padding: 8px; }
+    .cards .card { flex: 0 0 165px; min-width: 0; }
     .card { padding: 8px 6px; }
     .card .c-sym { font-size: 12px; margin-bottom: 4px; }
     .card .c-row { grid-template-columns: 36px minmax(0,1fr); gap: 4px; font-size: 11px; line-height: 1.7; }
