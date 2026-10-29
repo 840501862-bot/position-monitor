@@ -296,8 +296,16 @@ function orderErrText(r){
   if(r && typeof r==="object" && (r.msg || r.code)) return "code "+r.code+" "+r.msg;
   return String(r);
 }
-// 每个交易对的"加仓"按钮逻辑：无仓开100USDT多单 / ROI>100%平仓 / ROI<-100%按当前数量加仓
-async function tradePair(displayName, accId){
+// 持仓方向判定：positionSide 优先（对冲模式），缺失时按持仓数量正负判断（单向模式）
+function posDir(p){
+  const s = p.positionSide || "";
+  if(s==="LONG" || s==="SHORT") return s;
+  return parseFloat(p.positionAmt)>0 ? "LONG" : "SHORT";
+}
+// 每个交易对的"加仓"按钮逻辑：按点击卡片的方向操作（绝不加错方向）——
+// 无该方向持仓 → 按该方向开100USDT / 该方向ROI>100% → 只平该方向 / 该方向ROI<-100% → 按该方向当前数量加仓
+// 同交易对多空双仓（对冲模式）互不干扰：点"多"卡只动多单，点"空"卡只动空单
+async function tradePair(displayName, accId, wantDir){
   const accs = getAccounts();
   const acc = accs.find(a=>a.id===accId) || accs[0];
   const status = document.getElementById("status");
@@ -312,6 +320,8 @@ async function tradePair(displayName, accId){
   }
   const host = cm ? cm.host : FAPI;
   const rawSym = cm ? cm.sym : (dlSym || displayName);
+  const dir = wantDir==="SHORT" ? "SHORT" : "LONG";   // 点击卡片的方向
+  const dirTxt = dir==="LONG" ? "多" : "空";
   let doneMsg = "";
   try{
     await Promise.all([ensureStepMap(), ensureStepMapDapi()]);
@@ -319,44 +329,44 @@ async function tradePair(displayName, accId){
     const positions = cm ? await fetchDeliveryPositions(key, secret) : await fetchPositions(key, secret);
     const held = (Array.isArray(positions)?positions:[]).filter(p=>
       p.symbol===rawSym && parseFloat(p.positionAmt)!==0);
-    if(!held.length){
-      // 无仓位：市价开多 100 USDT
+    // 该方向的持仓（同交易对多空双仓互不干扰）
+    const pos = held.find(p=>posDir(p)===dir);
+    if(!pos){
+      // 无该方向持仓：按点击的方向市价开仓 100 USDT（占位卡点"空"就开空，点"多"就开多）
       const price = await fetchPrice(host, rawSym);
       if(!(price>0)){ status.textContent = displayName+" 获取价格失败，未开仓"; return; }
       const step = cm ? stepMapDapiCache[rawSym] : stepMapCache[rawSym];
       const qty = roundDownToStep(100/price, step);
       if(!(qty>0)){ status.textContent = displayName+" 开仓数量过小（精度 "+step+"，100/价格="+(100/price).toFixed(6)+"），未开仓"; return; }
-      status.textContent = "开仓 "+displayName+" "+qty+"（≈100 USDT）…";
-      const r = await placeOrder(host, rawSym, "BUY", "LONG", qty, false, acc);
-      doneMsg = (r && r.orderId) ? "开仓成功 "+displayName+" "+qty+"（order "+r.orderId+"）" : "开仓失败 "+displayName+"："+orderErrText(r);
+      status.textContent = "开仓 "+displayName+" "+dirTxt+" "+qty+"（≈100 USDT）…";
+      const r = await placeOrder(host, rawSym, dir==="LONG"?"BUY":"SELL", dir, qty, false, acc);
+      doneMsg = (r && r.orderId) ? "开仓成功 "+displayName+" "+dirTxt+" "+qty+"（order "+r.orderId+"）" : "开仓失败 "+displayName+"："+orderErrText(r);
     }else{
-      // 有仓位：按持仓量最大的那笔判断
-      held.sort((a,b)=>Math.abs(parseFloat(b.positionAmt))-Math.abs(parseFloat(a.positionAmt)));
-      const pos = held[0];
       const amt = parseFloat(pos.positionAmt);
-      const ps = pos.positionSide || (amt>0 ? "LONG" : "SHORT");
+      const ps = posDir(pos);
       const info = positionInfo(pos);
       if(info.roi > 100){
-        // 平仓：清掉该交易对全部非零持仓
+        // 平仓：只平点击方向的持仓，另一方向的仓位不受影响
+        let any = false;
         for(const q of held){
-          const qAmt = parseFloat(q.positionAmt);
-          const qSide = q.positionSide || (qAmt>0 ? "LONG" : "SHORT");
+          if(posDir(q)!==ps) continue;
           const qtyStr = q.positionAmt.startsWith("-") ? q.positionAmt.slice(1) : q.positionAmt;
-          status.textContent = "平仓 "+displayName+"（ROI "+info.roi.toFixed(2)+"% > 100%）…";
-          const r = await placeOrder(host, rawSym, qSide==="LONG"?"SELL":"BUY", qSide, qtyStr, true, acc);
+          status.textContent = "平仓 "+displayName+" "+dirTxt+"（ROI "+info.roi.toFixed(2)+"% > 100%）…";
+          const r = await placeOrder(host, rawSym, ps==="LONG"?"SELL":"BUY", ps, qtyStr, true, acc);
           if(!(r && r.orderId)){ status.textContent = "平仓失败 "+displayName+"："+orderErrText(r); return; }
+          any = true;
         }
-        doneMsg = "平仓成功 "+displayName+"（order "+held.map(h=>h.positionSide).join("/")+"）";
+        doneMsg = any ? "平仓成功 "+displayName+" "+dirTxt+"（order 已成交）" : displayName+" "+dirTxt+" 无持仓，不操作";
       }else if(info.roi < -100){
-        // 加仓：按当前持仓数量原数量加仓
+        // 加仓：按该方向当前持仓数量原数量加仓（方向与点击卡片一致，绝不加错方向）
         const step = cm ? stepMapDapiCache[rawSym] : stepMapCache[rawSym];
         const qty = roundDownToStep(Math.abs(amt), step);
         if(!(qty>0)){ status.textContent = displayName+" 加仓数量过小，未加仓"; return; }
-        status.textContent = "加仓 "+displayName+" "+qty+"（ROI "+info.roi.toFixed(2)+"% < -100%）…";
+        status.textContent = "加仓 "+displayName+" "+dirTxt+" "+qty+"（ROI "+info.roi.toFixed(2)+"% < -100%）…";
         const r = await placeOrder(host, rawSym, ps==="LONG"?"BUY":"SELL", ps, qty, false, acc);
-        doneMsg = (r && r.orderId) ? "加仓成功 "+displayName+" "+qty+"（order "+r.orderId+"）" : "加仓失败 "+displayName+"："+orderErrText(r);
+        doneMsg = (r && r.orderId) ? "加仓成功 "+displayName+" "+dirTxt+" "+qty+"（order "+r.orderId+"）" : "加仓失败 "+displayName+"："+orderErrText(r);
       }else{
-        doneMsg = displayName+" 回报率 "+info.roi.toFixed(2)+"%（-100%~+100% 之间），不操作";
+        doneMsg = displayName+" "+dirTxt+" 回报率 "+info.roi.toFixed(2)+"%（-100%~+100% 之间），不操作";
       }
     }
     await fetchData();
@@ -461,7 +471,7 @@ async function fetchData(accId){
               '<div class="c-row"><span class="lbl">方向</span><span>'+(dir==="LONG"?"多":"空")+'</span></div>'+
               '<div class="c-row"><span class="lbl">数量</span><span class="num">-</span></div>'+
               '<div class="c-row"><span class="lbl">回报率</span><span class="num">-</span></div>'+
-              '<button onclick="tradePair(\''+display+'\','+acc.id+')" style="width:100%;margin-top:6px;padding:3px 0;font-size:12px">加仓</button>'+
+              '<button onclick="tradePair(\''+display+'\','+acc.id+',\''+dir+'\')" style="width:100%;margin-top:6px;padding:3px 0;font-size:12px">加仓</button>'+
             '</div>';
             blockCount++;
             continue;
@@ -480,7 +490,7 @@ async function fetchData(accId){
               '<div class="c-row"><span class="lbl">方向</span><span class="'+dirCls+'">'+dirTxt+'</span></div>'+
               '<div class="c-row"><span class="lbl">数量</span><span class="num">'+notionalTxt+'</span></div>'+
               '<div class="c-row"><span class="lbl">回报率</span><span class="num '+roiCls+'">'+roiTxt+'</span></div>'+
-              '<button onclick="tradePair(\''+display+'\','+acc.id+')" style="width:100%;margin-top:6px;padding:3px 0;font-size:12px">加仓</button>'+
+              '<button onclick="tradePair(\''+display+'\','+acc.id+',\''+dir+'\')" style="width:100%;margin-top:6px;padding:3px 0;font-size:12px">加仓</button>'+
             '</div>';
             blockCount++;
           }
