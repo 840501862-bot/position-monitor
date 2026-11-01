@@ -126,6 +126,17 @@
   </div>
 </div>
 
+<div class="mask" id="confirmMask">
+  <div class="modal" style="width:min(420px,92vw)">
+    <h3 id="confirmTitle">确认操作</h3>
+    <div id="confirmBody"></div>
+    <div class="row">
+      <button onclick="confirmCancel()">取消</button>
+      <button class="primary" onclick="confirmOk()">确认下单</button>
+    </div>
+  </div>
+</div>
+
 <script>
 "use strict";
 const FAPI = "https://fapi.binance.com";
@@ -338,6 +349,15 @@ async function tradePair(displayName, accId, wantDir){
       const step = cm ? stepMapDapiCache[rawSym] : stepMapCache[rawSym];
       const qty = roundDownToStep(100/price, step);
       if(!(qty>0)){ status.textContent = displayName+" 开仓数量过小（精度 "+step+"，100/价格="+(100/price).toFixed(6)+"），未开仓"; return; }
+      status.textContent = "等待确认开仓 "+displayName+" "+dirTxt+" "+qty+"（≈100 USDT）…";
+      const okOpen = await askConfirm("确认开仓？", [
+        ["交易对", displayName],
+        ["方向", dirTxt],
+        ["数量", qty],
+        ["预估价值", "≈100 USDT"],
+        ["下单类型", "市价 MARKET"]
+      ]);
+      if(!okOpen){ status.textContent = "已取消开仓 "+displayName; return; }
       status.textContent = "开仓 "+displayName+" "+dirTxt+" "+qty+"（≈100 USDT）…";
       const r = await placeOrder(host, rawSym, dir==="LONG"?"BUY":"SELL", dir, qty, false, acc);
       doneMsg = (r && r.orderId) ? "开仓成功 "+displayName+" "+dirTxt+" "+qty+"（order "+r.orderId+"）" : "开仓失败 "+displayName+"："+orderErrText(r);
@@ -362,6 +382,15 @@ async function tradePair(displayName, accId, wantDir){
         const step = cm ? stepMapDapiCache[rawSym] : stepMapCache[rawSym];
         const qty = roundDownToStep(Math.abs(amt), step);
         if(!(qty>0)){ status.textContent = displayName+" 加仓数量过小，未加仓"; return; }
+        status.textContent = "等待确认加仓 "+displayName+" "+dirTxt+" "+qty+"（ROI "+info.roi.toFixed(2)+"% < -100%）…";
+        const okAdd = await askConfirm("确认加仓？", [
+          ["交易对", displayName],
+          ["方向", dirTxt],
+          ["当前回报率", info.roi.toFixed(2)+"%"],
+          ["加仓数量", qty],
+          ["下单类型", "市价 MARKET"]
+        ]);
+        if(!okAdd){ status.textContent = "已取消加仓 "+displayName; return; }
         status.textContent = "加仓 "+displayName+" "+dirTxt+" "+qty+"（ROI "+info.roi.toFixed(2)+"% < -100%）…";
         const r = await placeOrder(host, rawSym, ps==="LONG"?"BUY":"SELL", ps, qty, false, acc);
         doneMsg = (r && r.orderId) ? "加仓成功 "+displayName+" "+dirTxt+" "+qty+"（order "+r.orderId+"）" : "加仓失败 "+displayName+"："+orderErrText(r);
@@ -546,6 +575,27 @@ function addRow(){
   document.getElementById("accRows").insertAdjacentHTML("beforeend", rowHtml("账户"+(n+1),"",""));
 }
 function closeSettings(){ document.getElementById("settingsMask").classList.remove("show"); }
+
+// ===== 下单确认弹窗：开仓/加仓前必须人工确认，确认后才会真正下单 =====
+let confirmResolver = null;
+function askConfirm(title, items){
+  document.getElementById("confirmTitle").textContent = title;
+  document.getElementById("confirmBody").innerHTML =
+    items.map(it=>'<div class="c-row"><span class="lbl">'+esc(it[0])+'</span><span>'+esc(it[1])+'</span></div>').join("") +
+    '<div class="hint">市价单将立即成交，请核对信息后确认</div>';
+  document.getElementById("confirmMask").classList.add("show");
+  return new Promise(res=>{ confirmResolver = res; });
+}
+function confirmOk(){
+  const r = confirmResolver; confirmResolver = null;
+  document.getElementById("confirmMask").classList.remove("show");
+  if(r) r(true);
+}
+function confirmCancel(){
+  const r = confirmResolver; confirmResolver = null;
+  document.getElementById("confirmMask").classList.remove("show");
+  if(r) r(false);
+}
 function saveSettings(){
   const accs = [];
   document.querySelectorAll("#accRows .arow").forEach(row=>{
