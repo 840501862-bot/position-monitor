@@ -398,7 +398,7 @@ async function tradePair(displayName, accId, wantDir){
         doneMsg = displayName+" "+dirTxt+" 回报率 "+info.roi.toFixed(2)+"%（-100%~+100% 之间），不操作";
       }
     }
-    await fetchData();
+    await fetchData(acc.id);   // 按当前账户刷新，加仓后不跳回第一个账户
     if(doneMsg) document.getElementById("status").textContent = doneMsg;
   }catch(e){
     status.textContent = "操作失败 "+displayName+"："+e.message;
@@ -423,6 +423,12 @@ function positionInfo(p){
 async function fetchData(accId){
   const accs = getAccounts();
   const container = document.getElementById("groups");
+  // 未显式指定账户时，沿用下拉框当前选中的账户（绝不回落到第一个账户）
+  if(accId===undefined || accId===null || Number.isNaN(parseInt(accId,10))){
+    const curSel = document.getElementById("accSel");
+    const cur = curSel ? parseInt(curSel.value,10) : NaN;
+    if(!Number.isNaN(cur)) accId = accs.find(a=>String(a.id)===String(cur)) ? cur : undefined;
+  }
   if(!accs.length){
     container.innerHTML = '<div class="empty">请先点「设置」填写 API Key / Secret</div>';
     openSettings();
