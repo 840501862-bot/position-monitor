@@ -273,7 +273,11 @@ async function ensureStepMapDapi(){
     stepMapDapiCache = {};
     for(const s of (d.symbols||[])){
       const f = (s.filters||[]).find(x=>x.filterType==="LOT_SIZE");
-      if(f) stepMapDapiCache[s.symbol] = parseFloat(f.stepSize);
+      if(f) stepMapDapiCache[s.symbol] = {
+        step: parseFloat(f.stepSize),
+        minQty: parseFloat(f.minQty)||1,
+        contractSize: parseFloat(s.contractSize)||0   // 币本位每张面值(USD)：BTCUSD_PERP=100，ETHUSD_PERP=10
+      };
     }
   }catch(e){ stepMapDapiCache = {}; }
 }
@@ -291,17 +295,52 @@ function roundDownToStep(qty, step){
   const d = Math.max(0, Math.ceil(-Math.log10(step)));
   return Math.floor(qty*Math.pow(10,d))/Math.pow(10,d);
 }
-// 下单（U本位/币本位通用，带 positionSide 以适配对冲模式）
+// 带签名的 GET（查询持仓模式等只读接口）
+async function signedGet(host, path, acc){
+  await ensureOffset();
+  const q = "timestamp="+(await nowMs())+"&recvWindow=10000";
+  const sig = await hexSign(acc.secret, q);
+  return fetchJson(host+"/"+apiBase(host)+path+"?"+q+"&signature="+sig, 15000, acc.key);
+}
+// 该市场的持仓模式：true=双向(对冲)，false=单向，null=未知。
+// 注意：U本位(fapi) 与币本位(dapi) 的持仓模式是分开设置的，必须各自查询
+let dualCache = {};
+async function isDualSide(host, acc){
+  const k = host+"|"+(acc?acc.key:"");
+  if(k in dualCache) return dualCache[k];
+  try{
+    const d = await signedGet(host, "/v1/positionSide/dual", acc);
+    dualCache[k] = (d && typeof d.dualSidePosition === "boolean") ? d.dualSidePosition : null;
+  }catch(e){ dualCache[k] = null; }
+  return dualCache[k];
+}
+// 下单（U本位/币本位通用）：
+// 双向持仓模式：必须带 positionSide，且不能带 reduceOnly（平仓靠反向 positionSide）
+// 单向持仓模式：绝不能带 positionSide（否则 -4061），平仓靠 reduceOnly
 async function placeOrder(host, sym, side, positionSide, qty, reduceOnly, acc){
   await ensureOffset();
-  const parts = ["symbol="+sym, "side="+side, "type=MARKET"];
-  if(positionSide) parts.push("positionSide="+positionSide);
-  if(qty!=null) parts.push("quantity="+qty);
-  if(reduceOnly) parts.push("reduceOnly=true");
-  parts.push("timestamp="+(await nowMs()), "recvWindow=10000");
-  const key = acc ? acc.key : "", secret = acc ? acc.secret : "";
-  const sig = await hexSign(secret, parts.join("&"));
-  return postJson(host+"/"+apiBase(host)+"/v1/order?"+parts.join("&")+"&signature="+sig, key);
+  const dual = await isDualSide(host, acc);
+  const send = async (withPositionSide, withReduceOnly) => {
+    const parts = ["symbol="+sym, "side="+side, "type=MARKET"];
+    if(withPositionSide) parts.push("positionSide="+positionSide);
+    if(qty!=null) parts.push("quantity="+qty);
+    if(withReduceOnly) parts.push("reduceOnly=true");
+    parts.push("timestamp="+(await nowMs()), "recvWindow=10000");
+    const key = acc ? acc.key : "", secret = acc ? acc.secret : "";
+    const sig = await hexSign(secret, parts.join("&"));
+    return postJson(host+"/"+apiBase(host)+"/v1/order?"+parts.join("&")+"&signature="+sig, key);
+  };
+  if(dual === false){
+    const r = await send(false, !!reduceOnly);
+    if(r && r.code === -4061){ dualCache[host+"|"+(acc?acc.key:"")] = true; return send(true, false); }
+    return r;
+  }
+  const r1 = await send(true, false);              // 双向，或模式未知时先按双向试
+  if(r1 && r1.code === -4061){                     // -4061：该市场实际是单向持仓
+    dualCache[host+"|"+(acc?acc.key:"")] = false;
+    return send(false, !!reduceOnly);
+  }
+  return r1;
 }
 function orderErrText(r){
   if(r && typeof r==="object" && (r.msg || r.code)) return "code "+r.code+" "+r.msg;
@@ -345,22 +384,37 @@ async function tradePair(displayName, accId, wantDir){
     if(!pos){
       // 无该方向持仓：按点击的方向市价开仓 100 USDT（占位卡点"空"就开空，点"多"就开多）
       const price = await fetchPrice(host, rawSym);
-      if(!(price>0)){ status.textContent = displayName+" 获取价格失败，未开仓"; return; }
-      const step = cm ? stepMapDapiCache[rawSym] : stepMapCache[rawSym];
-      const qty = roundDownToStep(100/price, step);
-      if(!(qty>0)){ status.textContent = displayName+" 开仓数量过小（精度 "+step+"，100/价格="+(100/price).toFixed(6)+"），未开仓"; return; }
-      status.textContent = "等待确认开仓 "+displayName+" "+dirTxt+" "+qty+"（≈100 USDT）…";
+      if(!cm && !(price>0)){ status.textContent = displayName+" 获取价格失败，未开仓"; return; }
+      // 币本位的数量单位是"张"（每张面值 contractSize 美元），不能按币数算：
+      // 100 美元折成 BTCUSD_PERP 是 1 张、ETHUSD_PERP 是 10 张，按币数算会得到 0.001 被取整成 0 → 永远开不了仓
+      const meta = cm ? (stepMapDapiCache[rawSym] || {}) : null;
+      const csize = (meta && meta.contractSize>0) ? meta.contractSize : 100;
+      const step = cm ? ((meta && meta.step>0) ? meta.step : 1) : stepMapCache[rawSym];
+      const minQty = cm ? ((meta && meta.minQty>0) ? meta.minQty : 1) : null;
+      let qty;
+      if(cm){
+        qty = Math.round((100/csize)*1e8)/1e8;        // 100 美元约等于多少张
+        qty = roundDownToStep(qty, step);
+        if(!(qty>0)) qty = minQty;                    // 至少 1 张
+      }else{
+        qty = roundDownToStep(100/price, step);
+        if(!(qty>0)){ status.textContent = displayName+" 开仓数量过小（步长 "+step+"，100/价格="+(100/price).toFixed(6)+"），未开仓"; return; }
+      }
+      const qtyUnit = cm ? "张" : "";
+      const qtyTxt = qty + qtyUnit;
+      const estUsd = cm ? (qty*csize) : (qty*price);
+      status.textContent = "等待确认开仓 "+displayName+" "+dirTxt+" "+qtyTxt+"（≈"+estUsd.toFixed(2)+" USDT）…";
       const okOpen = await askConfirm("确认开仓？", [
         ["交易对", displayName],
         ["方向", dirTxt],
-        ["数量", qty],
-        ["预估价值", "≈100 USDT"],
+        ["数量", qtyTxt],
+        ["预估价值", "≈"+estUsd.toFixed(2)+" USDT"],
         ["下单类型", "市价 MARKET"]
       ]);
       if(!okOpen){ status.textContent = "已取消开仓 "+displayName; return; }
-      status.textContent = "开仓 "+displayName+" "+dirTxt+" "+qty+"（≈100 USDT）…";
+      status.textContent = "开仓 "+displayName+" "+dirTxt+" "+qtyTxt+"（≈"+estUsd.toFixed(2)+" USDT）…";
       const r = await placeOrder(host, rawSym, dir==="LONG"?"BUY":"SELL", dir, qty, false, acc);
-      doneMsg = (r && r.orderId) ? "开仓成功 "+displayName+" "+dirTxt+" "+qty+"（order "+r.orderId+"）" : "开仓失败 "+displayName+"："+orderErrText(r);
+      doneMsg = (r && r.orderId) ? "开仓成功 "+displayName+" "+dirTxt+" "+qtyTxt+"（order "+r.orderId+"）" : "开仓失败 "+displayName+"："+orderErrText(r);
     }else{
       const amt = parseFloat(pos.positionAmt);
       const ps = posDir(pos);
@@ -379,21 +433,24 @@ async function tradePair(displayName, accId, wantDir){
         doneMsg = any ? "平仓成功 "+displayName+" "+dirTxt+"（order 已成交）" : displayName+" "+dirTxt+" 无持仓，不操作";
       }else if(info.roi < -100){
         // 加仓：按该方向当前持仓数量原数量加仓（方向与点击卡片一致，绝不加错方向）
-        const step = cm ? stepMapDapiCache[rawSym] : stepMapCache[rawSym];
+        // 币本位持仓数量本身就是"张"，直接按张数加，无需再按价格折算
+        const metaAdd = cm ? (stepMapDapiCache[rawSym] || {}) : null;
+        const step = cm ? ((metaAdd && metaAdd.step>0) ? metaAdd.step : 1) : stepMapCache[rawSym];
         const qty = roundDownToStep(Math.abs(amt), step);
         if(!(qty>0)){ status.textContent = displayName+" 加仓数量过小，未加仓"; return; }
-        status.textContent = "等待确认加仓 "+displayName+" "+dirTxt+" "+qty+"（ROI "+info.roi.toFixed(2)+"% < -100%）…";
+        const qtyTxtAdd = qty + (cm ? "张" : "");
+        status.textContent = "等待确认加仓 "+displayName+" "+dirTxt+" "+qtyTxtAdd+"（ROI "+info.roi.toFixed(2)+"% < -100%）…";
         const okAdd = await askConfirm("确认加仓？", [
           ["交易对", displayName],
           ["方向", dirTxt],
           ["当前回报率", info.roi.toFixed(2)+"%"],
-          ["加仓数量", qty],
+          ["加仓数量", qtyTxtAdd],
           ["下单类型", "市价 MARKET"]
         ]);
         if(!okAdd){ status.textContent = "已取消加仓 "+displayName; return; }
-        status.textContent = "加仓 "+displayName+" "+dirTxt+" "+qty+"（ROI "+info.roi.toFixed(2)+"% < -100%）…";
+        status.textContent = "加仓 "+displayName+" "+dirTxt+" "+qtyTxtAdd+"（ROI "+info.roi.toFixed(2)+"% < -100%）…";
         const r = await placeOrder(host, rawSym, ps==="LONG"?"BUY":"SELL", ps, qty, false, acc);
-        doneMsg = (r && r.orderId) ? "加仓成功 "+displayName+" "+dirTxt+" "+qty+"（order "+r.orderId+"）" : "加仓失败 "+displayName+"："+orderErrText(r);
+        doneMsg = (r && r.orderId) ? "加仓成功 "+displayName+" "+dirTxt+" "+qtyTxtAdd+"（order "+r.orderId+"）" : "加仓失败 "+displayName+"："+orderErrText(r);
       }else{
         doneMsg = displayName+" "+dirTxt+" 回报率 "+info.roi.toFixed(2)+"%（-100%~+100% 之间），不操作";
       }
