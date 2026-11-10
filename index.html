@@ -46,7 +46,6 @@
     background: #142543; border: 1px solid #2a4d7f;
     border-radius: 6px; padding: 12px 14px; min-width: 0;
   }
-  .break { flex-basis: 100%; height: 0; }
   .card .c-sym { font-weight: 700; color: #fff; font-size: 15px; margin-bottom: 7px; }
   /* 行内固定两列：标签固定宽，数值右对齐；数值超长截断省略号，绝不挤压/挪动其他内容 */
   .card .c-row { display: grid; grid-template-columns: 46px minmax(0,1fr); gap: 6px; align-items: baseline; font-size: 12px; line-height: 1.9; }
@@ -140,7 +139,6 @@
 <script>
 "use strict";
 const FAPI = "https://fapi.binance.com";
-const DAPI = "https://dapi.binance.com";
 const PAIRS = ["BTCUSDT","BTCUSDC","BTCUSD1","BTCU",
   "ETHUSDT","ETHUSDC","ETHUSD1","ETHU",
   "XAUUSDT","XAUTUSDT","PAXGUSDT"];
@@ -151,28 +149,42 @@ const GROUPS = [
 ];
 const KEY_STORE = "bc_keys_v1";
 
-// ===== U本位(USDⓈ-M)季度交割合约 =====
-// 识别规则：fapi /v1/exchangeInfo 中 contractType=CURRENT_QUARTER(当季)/NEXT_QUARTER(次季)，
-// baseAsset 为 BTC/ETH，交易对如 BTCUSDT_261225 / BTCUSDT_270326（USDT 结算）。
-// 每季度交割后 symbol 会变化，这里每次加载自动识别，无需手改。
+// ===== U本位(USDⓈ-M) 合约元信息（交易规则 + 当季/次季交割合约） =====
+// 只请求一次 exchangeInfo：交易规则（步长/最小数量/最小名义/价格精度）与交割合约列表共用结果。
+// 交割合约识别规则：contractType=CURRENT_QUARTER/NEXT_QUARTER，baseAsset 为 BTC/ETH，
+// symbol 形如 BTCUSDT_261225，每季度自动变化，无需手改。
 let DELIV = {BTC:[], ETH:[]};
-async function ensureDeliveryPairs(){
+let META = null;
+async function ensureMeta(){
+  if(META) return META;
+  const rules = {}, deliv = {BTC:[], ETH:[]};
   try{
-    const d = await fetchJson(FAPI+"/fapi/v1/exchangeInfo", 30000);
-    const out = {BTC:[], ETH:[]};
+    const d = await httpJson(FAPI+"/fapi/v1/exchangeInfo", 30000);
     for(const s of (d.symbols||[])){
+      const f = {};
+      for(const x of (s.filters||[])) f[x.filterType] = x;
+      const lot = f.MARKET_LOT_SIZE || f.LOT_SIZE || {};
+      let step = parseFloat(lot.stepSize)||0;
+      if(step<=0) step = Math.pow(10, -(parseInt(s.quantityPrecision,10)||4));
+      rules[s.symbol] = {
+        step: step,
+        minQty: parseFloat(lot.minQty)||0,
+        minNotional: parseFloat((f.MIN_NOTIONAL||{}).notional)||0,
+        pricePrec: parseInt(s.pricePrecision,10)||2
+      };
       const ct = s.contractType || "";
-      if(ct!=="CURRENT_QUARTER" && ct!=="NEXT_QUARTER") continue;
-      if(s.baseAsset!=="BTC" && s.baseAsset!=="ETH") continue;
-      out[s.baseAsset].push({display:s.baseAsset+(ct==="CURRENT_QUARTER"?"当季":"次季"), symbol:s.symbol, ct});
+      if((ct==="CURRENT_QUARTER" || ct==="NEXT_QUARTER") && (s.baseAsset==="BTC" || s.baseAsset==="ETH")){
+        deliv[s.baseAsset].push({display:s.baseAsset+(ct==="CURRENT_QUARTER"?"当季":"次季"), symbol:s.symbol, ct});
+      }
     }
     // 排序：次季在前、当季在后
-    for(const k of Object.keys(out)){
-      out[k].sort((a,b)=> a.ct===b.ct ? 0 : (a.ct==="NEXT_QUARTER" ? -1 : 1));
-    }
-    DELIV = out;
-  }catch(e){ /* 识别失败则不显示交割卡 */ }
+    for(const k of Object.keys(deliv)) deliv[k].sort((a,b)=> a.ct===b.ct ? 0 : (a.ct==="NEXT_QUARTER" ? -1 : 1));
+    DELIV = deliv;
+  }catch(e){ /* 识别失败则不显示交割卡、规则留空 */ }
+  META = {rules, deliv};
+  return META;
 }
+async function ensureRules(){ return (await ensureMeta()).rules; }
 
 function loadKeys(){
   try{
@@ -191,7 +203,7 @@ let serverRefMs=0, serverRefPerf=0, syncOk=false;
 async function ensureOffset(){
   if(syncOk && performance.now()-serverRefPerf<60000) return;
   try{
-    const d = await fetchJson(FAPI+"/fapi/v1/time", 8000);
+    const d = await httpJson(FAPI+"/fapi/v1/time", 8000);
     if(d && d.serverTime>0){ serverRefMs=d.serverTime; serverRefPerf=performance.now(); syncOk=true; }
   }catch(e){}
 }
@@ -208,12 +220,12 @@ async function hexSign(secret, msg){
   return Array.from(new Uint8Array(sig)).map(b=>b.toString(16).padStart(2,"0")).join("");
 }
 
-// 带超时的 JSON 请求（U本位/币本位通用，避免某个接口卡住拖垮整页）
-async function fetchJson(url, timeoutMs, apiKey){
+// 全站唯一 HTTP 出口：带超时 + 可选 API Key + 可选 method，返回 JSON（解析失败返回原文）
+async function httpJson(url, timeoutMs, apiKey, method){
   const ctl = new AbortController();
   const t = setTimeout(()=>ctl.abort(), timeoutMs||15000);
   try{
-    const r = await fetch(url, {signal:ctl.signal, headers: apiKey?{"X-MBX-APIKEY":apiKey}:{}});
+    const r = await fetch(url, {method:method||"GET", headers:apiKey?{"X-MBX-APIKEY":apiKey}:{}, signal:ctl.signal});
     const txt = await r.text();
     try{ return JSON.parse(txt); }catch(e){ return txt; }
   }finally{ clearTimeout(t); }
@@ -221,125 +233,80 @@ async function fetchJson(url, timeoutMs, apiKey){
 
 async function fetchPositions(key, secret){
   await ensureOffset();
-  const params = "timestamp="+(await nowMs())+"&recvWindow=10000";
-  const sig = await hexSign(secret, params);
-  return fetchJson(FAPI+"/fapi/v2/positionRisk?"+params+"&signature="+sig, 20000, key);
+  const q = "timestamp="+(await nowMs())+"&recvWindow=10000";
+  const sig = await hexSign(secret, q);
+  return httpJson(FAPI+"/fapi/v2/positionRisk?"+q+"&signature="+sig, 20000, key);
 }
-function apiBase(host){ return host===DAPI ? "dapi" : "fapi"; }
-// 说明：BTCU / ETHU 是【U本位 USDⓈ-M】永续合约，fapi 里就有 BTCU、ETHU 两个独立 symbol
+// 说明：BTCU / ETHU 是【U本位 USDⓈ-M】永续合约，fapi 里就有这两个独立 symbol
 // （报价/保证金资产都是 U，BTCU 步长 0.0001、ETHU 步长 0.001，最小名义 5 USDT）。
 // 早期版本曾把它们映射成币本位 dapi 的 BTCUSD_PERP，属于错误映射：请求打到另一个市场，
-// 浏览器侧表现为 "Failed to fetch"，下单也永远对不上号。现已彻底去掉该映射。
-// 带超时的 POST 请求（币安下单用）
-async function postJson(url, apiKey){
-  const ctl = new AbortController();
-  const t = setTimeout(()=>ctl.abort(), 20000);
-  try{
-    const r = await fetch(url, {method:"POST", headers: apiKey?{"X-MBX-APIKEY":apiKey}:{}, signal:ctl.signal});
-    const txt = await r.text();
-    try{ return JSON.parse(txt); }catch(e){ return txt; }
-  }finally{ clearTimeout(t); }
+// 浏览器侧表现为 "Failed to fetch"。现已彻底去掉映射，全站只走 fapi。
+// 签名请求：signedGet 只读，signedReq 支持任意 method（下单/撤单用）
+async function signedReq(acc, method, path, params, timeoutMs){
+  await ensureOffset();
+  const q = (params||[]).concat(["timestamp="+(await nowMs()), "recvWindow=10000"]).join("&");
+  const sig = await hexSign(acc.secret, q);
+  return httpJson(FAPI+"/fapi"+path+"?"+q+"&signature="+sig, timeoutMs||20000, acc.key, method);
+}
+function signedGet(acc, path, params){
+  return signedReq(acc, "GET", path, params, 15000);
 }
 // 交易规则缓存（数量步长 / 最小数量 / 最小名义 / 价格精度），加仓与止损都用它
-let ruleMapCache=null;
-async function ensureRules(){
-  if(ruleMapCache) return ruleMapCache;
-  try{
-    const d = await fetchJson(FAPI+"/fapi/v1/exchangeInfo", 30000);
-    const map = {};
-    for(const s of (d.symbols||[])){
-      const f = {};
-      for(const x of (s.filters||[])) f[x.filterType] = x;
-      const lot = f.MARKET_LOT_SIZE || f.LOT_SIZE || {};
-      let step = parseFloat(lot.stepSize)||0;
-      if(step<=0) step = Math.pow(10, -(parseInt(s.quantityPrecision,10)||4));
-      map[s.symbol] = {
-        step: step,
-        minQty: parseFloat(lot.minQty)||0,
-        minNotional: parseFloat((f.MIN_NOTIONAL||{}).notional)||0,
-        pricePrec: parseInt(s.pricePrecision,10)||2
-      };
-    }
-    ruleMapCache = map;
-  }catch(e){ ruleMapCache = {}; }
-  return ruleMapCache;
-}
+// （实现见顶部 ensureMeta，与交割合约识别共用同一次 exchangeInfo 请求）
 const sleep = ms => new Promise(r=>setTimeout(r, ms));
-let priceCache={}, priceCacheTs=0;
-async function fetchPrice(host, sym){
-  const k = host+"|"+sym;
-  if(priceCache[k] && Date.now()-priceCacheTs<30000) return priceCache[k];
-  const d = await fetchJson(host+"/"+apiBase(host)+"/v1/ticker/price?symbol="+sym, 8000);
+// 价格缓存：按 symbol 各自 30 秒，避免不同币种互相顶掉缓存
+const priceCache = {};
+async function fetchPrice(sym){
+  const c = priceCache[sym];
+  if(c && Date.now()-c.t < 30000) return c.p;
+  const d = await httpJson(FAPI+"/fapi/v1/ticker/price?symbol="+sym, 8000);
   const p = d && parseFloat(d.price);
-  if(p>0){ priceCache[k]=p; priceCacheTs=Date.now(); return p; }
+  if(p>0){ priceCache[sym] = {p, t:Date.now()}; return p; }
   return null;
 }
-function roundDownToStep(qty, step){
-  if(!(step>0) || !(qty>0)) return null;
-  const d = Math.max(0, Math.ceil(-Math.log10(step)));
-  return Math.floor(qty*Math.pow(10,d))/Math.pow(10,d);
+// 数量按交易所步长取整（不取整会报 -1111）
+function stepFactor(step){ return Math.pow(10, Math.max(0, Math.ceil(-Math.log10(step)))); }
+function floorToStep(qty, step){
+  if(!(step>0) || !(qty>0)) return 0;
+  const f = stepFactor(step);
+  return Math.floor(qty*f)/f;
 }
-// 带签名的 GET（查询持仓模式等只读接口）
-async function signedGet(host, path, acc, extra){
-  await ensureOffset();
-  const parts = (extra||[]).slice();
-  parts.push("timestamp="+(await nowMs()), "recvWindow=10000");
-  const q = parts.join("&");
-  const sig = await hexSign(acc.secret, q);
-  return fetchJson(host+"/"+apiBase(host)+path+"?"+q+"&signature="+sig, 15000, acc.key);
+function ceilToStep(qty, step){
+  if(!(step>0)) return qty>0 ? qty : 0;
+  const f = stepFactor(step);
+  return Math.ceil(qty*f)/f;
 }
-// 通用签名请求（DELETE / POST 等，/v1/order、/v1/openOrders 用）
-async function signedReq(method, host, path, params, acc){
-  await ensureOffset();
-  const parts = (params||[]).slice();
-  parts.push("timestamp="+(await nowMs()), "recvWindow=10000");
-  const q = parts.join("&");
-  const sig = await hexSign(acc.secret, q);
-  const url = host+"/"+apiBase(host)+path+"?"+q+"&signature="+sig;
-  const ctl = new AbortController();
-  const t = setTimeout(()=>ctl.abort(), 20000);
-  try{
-    const r = await fetch(url, {method:method, headers:{"X-MBX-APIKEY":acc.key}, signal:ctl.signal});
-    const txt = await r.text();
-    try{ return JSON.parse(txt); }catch(e){ return txt; }
-  }finally{ clearTimeout(t); }
-}
-// 该市场的持仓模式：true=双向(对冲)，false=单向，null=未知。
-// 注意：U本位(fapi) 与币本位(dapi) 的持仓模式是分开设置的，必须各自查询
+// 账户的持仓模式：true=双向(对冲)，false=单向，null=未知（按账户缓存）
 let dualCache = {};
-async function isDualSide(host, acc){
-  const k = host+"|"+(acc?acc.key:"");
+async function isDualSide(acc){
+  const k = acc ? acc.key : "";
   if(k in dualCache) return dualCache[k];
   try{
-    const d = await signedGet(host, "/v1/positionSide/dual", acc);
+    const d = await signedGet(acc, "/v1/positionSide/dual");
     dualCache[k] = (d && typeof d.dualSidePosition === "boolean") ? d.dualSidePosition : null;
   }catch(e){ dualCache[k] = null; }
   return dualCache[k];
 }
-// 下单（U本位/币本位通用）：
+// 市价下单：
 // 双向持仓模式：必须带 positionSide，且不能带 reduceOnly（平仓靠反向 positionSide）
-// 单向持仓模式：绝不能带 positionSide（否则 -4061），平仓靠 reduceOnly
-async function placeOrder(host, sym, side, positionSide, qty, reduceOnly, acc){
-  await ensureOffset();
-  const dual = await isDualSide(host, acc);
+// 单向持仓模式：不能带 positionSide（否则 -4061），平仓靠 reduceOnly
+async function placeOrder(sym, side, positionSide, qty, reduceOnly, acc){
+  const dual = await isDualSide(acc);
   const send = async (withPositionSide, withReduceOnly) => {
     const parts = ["symbol="+sym, "side="+side, "type=MARKET"];
     if(withPositionSide) parts.push("positionSide="+positionSide);
     if(qty!=null) parts.push("quantity="+qty);
     if(withReduceOnly) parts.push("reduceOnly=true");
-    parts.push("timestamp="+(await nowMs()), "recvWindow=10000");
-    const key = acc ? acc.key : "", secret = acc ? acc.secret : "";
-    const sig = await hexSign(secret, parts.join("&"));
-    return postJson(host+"/"+apiBase(host)+"/v1/order?"+parts.join("&")+"&signature="+sig, key);
+    return signedReq(acc, "POST", "/v1/order", parts);
   };
   if(dual === false){
     const r = await send(false, !!reduceOnly);
-    if(r && r.code === -4061){ dualCache[host+"|"+(acc?acc.key:"")] = true; return send(true, false); }
+    if(r && r.code === -4061){ dualCache[acc.key] = true; return send(true, false); }
     return r;
   }
   const r1 = await send(true, false);              // 双向，或模式未知时先按双向试
-  if(r1 && r1.code === -4061){                     // -4061：该市场实际是单向持仓
-    dualCache[host+"|"+(acc?acc.key:"")] = false;
+  if(r1 && r1.code === -4061){                     // -4061：该账户实际是单向持仓
+    dualCache[acc.key] = false;
     return send(false, !!reduceOnly);
   }
   return r1;
@@ -355,34 +322,36 @@ function posDir(p){
   return parseFloat(p.positionAmt)>0 ? "LONG" : "SHORT";
 }
 /* ============ 38% 加仓 + 立即设止损（移植自 roi-board 的加仓止损逻辑） ============ */
+// 方向工具：多单开仓/加仓是 BUY、平仓/止损是 SELL，空单相反
+function dirLabel(dir){ return dir==="LONG" ? "多" : "空"; }
+function closeSide(dir){ return dir==="LONG" ? "SELL" : "BUY"; }
+function openSide(dir){ return dir==="LONG" ? "BUY" : "SELL"; }
+// 某 symbol 的所有非零持仓（同交易对多空双仓各一条）
+async function getPositionsOf(acc, sym){
+  const data = await fetchPositions(acc.key, acc.secret);
+  if(!Array.isArray(data)) return [];
+  return data.filter(p=>p.symbol===sym && (parseFloat(p.positionAmt)||0)!==0);
+}
 // 查单方向持仓（含入场均价，用于算止损）
 async function getPosition(acc, sym, dir){
-  const data = await fetchPositions(acc.key, acc.secret);
-  if(!Array.isArray(data)) return null;
-  for(const p of data){
-    if(p.symbol!==sym) continue;
-    const amt = parseFloat(p.positionAmt)||0;
-    if(amt===0) continue;
-    if((dir==="LONG" && amt>0) || (dir==="SHORT" && amt<0)) return positionInfo(p);
-  }
-  return null;
+  const hit = (await getPositionsOf(acc, sym)).find(p=>posDir(p)===dir);
+  return hit ? positionInfo(hit) : null;
 }
 // 撤掉该方向已有的旧止损（普通 STOP_MARKET + reduceOnly），换新止损前先清干净
 async function cancelPosSL(acc, sym, dir){
   let cancelled = 0;
   try{
-    const d = await signedGet(FAPI, "/v1/openOrders", acc, ["symbol="+sym]);
-    const list = Array.isArray(d) ? d : [];
-    const wantSide = dir==="LONG" ? "SELL" : "BUY";
-    const wantPS = dir==="LONG" ? ["LONG","BOTH"] : ["SHORT","BOTH"];
-    for(const o of list){
+    const d = await signedGet(acc, "/v1/openOrders", ["symbol="+sym]);
+    const wSide = closeSide(dir);
+    const wPS = dir==="LONG" ? ["LONG","BOTH"] : ["SHORT","BOTH"];
+    for(const o of (Array.isArray(d) ? d : [])){
       if(String(o.type)!=="STOP_MARKET") continue;
-      if(String(o.side)!==wantSide) continue;
-      if(wantPS.indexOf(String(o.positionSide))<0) continue;
+      if(String(o.side)!==wSide) continue;
+      if(wPS.indexOf(String(o.positionSide))<0) continue;
       if(!(o.reduceOnly===true || String(o.reduceOnly)==="true")) continue;
       for(let t=0; t<3; t++){
         try{
-          const r = await signedReq("DELETE", FAPI, "/v1/order", ["symbol="+sym, "orderId="+o.orderId], acc);
+          const r = await signedReq(acc, "DELETE", "/v1/order", ["symbol="+sym, "orderId="+o.orderId]);
           if(r && r.code===undefined){ cancelled++; break; }
         }catch(e){ await sleep(250*(t+1)); }
       }
@@ -390,31 +359,33 @@ async function cancelPosSL(acc, sym, dir){
   }catch(e){}
   return cancelled;
 }
+/* 止损价 = 入场均价 ± 当前浮盈的 50%，并夹在入场价与现价之间：
+   多单不低于入场价、空单不高于入场价，锁的永远是盈利的一半，绝不会挂到亏损位。
+   加仓前的预估价与成交后的实挂价共用这一处公式，保证两处永远一致。 */
+function stopPriceOf(pos){
+  const amtAbs = Math.abs(pos.amt)||0;
+  if(pos.entry>0){
+    const ppu = pos.amt>0 ? (pos.mark-pos.entry) : (pos.entry-pos.mark);
+    const raw = pos.amt>0 ? (pos.entry+ppu*0.5) : (pos.entry-ppu*0.5);
+    return pos.amt>0
+      ? Math.min(Math.max(raw, pos.entry), pos.mark)
+      : Math.max(Math.min(raw, pos.entry), pos.mark);
+  }
+  const half = amtAbs>0 ? pos.unrealized*0.5/amtAbs : 0;
+  return pos.amt>0 ? pos.mark-half : pos.mark+half;
+}
 /* 挂止损（STOP_MARKET）：
-   止损价 = 入场均价 + 当前浮盈的 50%（多单）；空单对称 = 入场价 -（入场价-现价）×50%
-   止损价永远夹在入场价与现价之间，锁定当前浮盈的一半，绝不会挂在亏损位。
    双向模式：positionSide=LONG/SHORT，不能带 reduceOnly；
-   单向模式：positionSide=BOTH + reduceOnly=true（数量算错也只会减仓，不会反向开仓）。 */
+   单向模式：positionSide=BOTH + reduceOnly=true（数量算错也只会减仓，不会反向开仓）。
+   -1106/-4061 换一套参数重试；-2021/-4004（触发价太近）把触发价推远但不越过入场价。 */
 async function setStopLoss(acc, sym, pos, dir){
   const rule = (await ensureRules())[sym] || {step:0, pricePrec:2};
   const amtAbs = Math.abs(pos.amt);
   if(!(amtAbs>0)) throw new Error("无持仓，无需设止损");
   if(!(pos.unrealized>0)) throw new Error("当前无浮盈，跳过止损设置");
-  let slQty = amtAbs;
-  if(rule.step>0) slQty = parseFloat((Math.floor(amtAbs/rule.step)*rule.step).toFixed(10));
-  if(!(slQty>0)) slQty = amtAbs;
-  const side = pos.amt>0 ? "SELL" : "BUY";
-  let stopPrice;
-  if(pos.entry>0){
-    const ppu = pos.amt>0 ? (pos.mark-pos.entry) : (pos.entry-pos.mark);
-    stopPrice = pos.amt>0 ? (pos.entry+ppu*0.5) : (pos.entry-ppu*0.5);
-    stopPrice = pos.amt>0
-      ? Math.min(Math.max(stopPrice, pos.entry), pos.mark)
-      : Math.max(Math.min(stopPrice, pos.entry), pos.mark);
-  }else{
-    const half = pos.unrealized*0.5/amtAbs;
-    stopPrice = pos.amt>0 ? pos.mark-half : pos.mark+half;
-  }
+  const slQty = floorToStep(amtAbs, rule.step) || amtAbs;   // 极小仓取整为 0 时保留原值尝试
+  const side = closeSide(dir);
+  let stopPrice = stopPriceOf(pos);
   const nudge = () => {
     const buf = pos.mark*0.005;
     if(pos.amt>0){ const fl = pos.entry>0 ? pos.entry*1.001 : -Infinity; return Math.max(pos.mark-buf, fl); }
@@ -422,9 +393,8 @@ async function setStopLoss(acc, sym, pos, dir){
     return Math.min(pos.mark+buf, ce);
   };
   let lastErr = null;
-  // 持仓模式未知时，两种参数组合都试一遍（双向：positionSide=方向，不带 reduceOnly；
-  // 单向：positionSide=BOTH + reduceOnly=true），遇 -4061 / -1106 自动换下一种
-  const dual = await isDualSide(FAPI, acc);
+  // 持仓模式未知时两种参数组合都试一遍（双向：positionSide=方向；单向：BOTH + reduceOnly）
+  const dual = await isDualSide(acc);
   const cands = dual===true ? [{ps:dir, ro:false}]
              : dual===false ? [{ps:"BOTH", ro:true}]
              : [{ps:dir, ro:false}, {ps:"BOTH", ro:true}];
@@ -437,18 +407,17 @@ async function setStopLoss(acc, sym, pos, dir){
           "stopPrice="+trigger, "quantity="+slQty, "timeInForce=GTE_GTC"];
         if(cand.ro) params.push("reduceOnly=true");
         params.push("positionSide="+cand.ps);
-        data = await signedReq("POST", FAPI, "/v1/order", params, acc);
+        data = await signedReq(acc, "POST", "/v1/order", params);
       }catch(e){ netErr=e; }
       if(netErr){ lastErr=netErr; await sleep(700); break; }
       if(data && data.code!==undefined){
         lastErr = data;
-        if(data.code===-1106 || data.code===-4061) continue;             // 持仓模式/仓位侧不符 → 换下一种参数
-        if(data.code===-1021){ syncOk = false; break; }                  // 时间偏差 → 重同步后重试
+        if(data.code===-1106 || data.code===-4061) continue;              // 持仓模式/仓位侧不符 → 换下一种参数
+        if(data.code===-1021){ syncOk = false; break; }                   // 时间偏差 → 重同步后重试
         if(data.code===-2021 || data.code===-4004){ stopPrice = nudge(); break; } // 触发价太近 → 推远
         break;
       }
-      if(data && data.orderId) return {stopPrice:stopPrice, orderId:data.orderId, qty:slQty};
-      if(data) return {stopPrice:stopPrice, orderId:null, qty:slQty};
+      if(data) return {stopPrice:stopPrice, orderId:data.orderId||null, qty:slQty};
     }
     if(attempt<1) await sleep(800);
   }
@@ -465,13 +434,12 @@ async function closePositionMarket(acc, sym, dir){
     catch(e){ lastErr=e; await sleep(800); continue; }
     if(!pos) return await finishClosed(acc, sym, dir);          // 已无仓位
     const rule = (await ensureRules())[sym] || {step:0};
-    let qty = Math.abs(pos.amt);
-    if(rule.step>0) qty = parseFloat((Math.floor(qty/rule.step)*rule.step).toFixed(10));
+    const qty = floorToStep(Math.abs(pos.amt), rule.step);
     if(!(qty>0)) return await finishClosed(acc, sym, dir);       // 只剩碎仓
     const before = Math.abs(pos.amt);
-    const side = pos.amt>0 ? "SELL" : "BUY";
+    const side = closeSide(dir);
     let r=null, netErr=null;
-    try{ r = await placeOrder(FAPI, sym, side, dir, qty, true, acc); }catch(e){ netErr=e; }
+    try{ r = await placeOrder(sym, side, dir, qty, true, acc); }catch(e){ netErr=e; }
     if(netErr){ lastErr=netErr; await sleep(1200); continue; }
     if(r && r.code!==undefined){
       lastErr = r;
@@ -505,23 +473,20 @@ async function finishClosed(acc, sym, dir){
 /* ============ 加仓 38% + 设止损 + 失败即平仓（ROI>100% 的卡片走这条） ============ */
 async function addPosWithStop(acc, sym, displayName, pos, dir, status){
   const rule = (await ensureRules())[sym] || {step:0, minQty:0, minNotional:0, pricePrec:2};
-  const dirTxt = dir==="LONG" ? "多" : "空";
+  const dirTxt = dirLabel(dir);
   const mark = pos.mark;
   // 1) 数量 = 当前持仓的 38%，按步长向下取整；不足最小名义/最小数量时退到最小可下单量
-  let qty = Math.abs(pos.amt) * 0.38;
-  if(rule.step>0) qty = parseFloat((Math.floor(qty/rule.step)*rule.step).toFixed(10));
+  let qty = floorToStep(Math.abs(pos.amt)*0.38, rule.step);
   let useMin = false;
   if(qty<=0 || (rule.minNotional>0 && qty*mark < rule.minNotional) || (rule.minQty>0 && qty < rule.minQty)){
     qty = rule.minNotional>0 ? (rule.minNotional+1)/mark : qty;
     if(rule.minQty>0 && qty < rule.minQty) qty = rule.minQty;
-    if(rule.step>0) qty = parseFloat((Math.ceil(qty/rule.step)*rule.step).toFixed(10));
+    qty = ceilToStep(qty, rule.step);
     useMin = true;
   }
   if(!(qty>0)) throw new Error("计算出的加仓数量为 0");
-  // 2) 预估止损价（加仓后均价会变，真实止损价在成交后按新持仓重算）
-  const estStop = pos.entry>0
-    ? (pos.amt>0 ? pos.entry + (mark-pos.entry)*0.5 : pos.entry - (pos.entry-mark)*0.5)
-    : mark;
+  // 2) 预估止损价（加仓后均价会变，真实止损价在成交后按新持仓重算，两处共用 stopPriceOf）
+  const estStop = stopPriceOf(pos);
   const okAdd = await askConfirm("确认加仓 38% 并设置止损？", [
     ["交易对", displayName],
     ["方向", dirTxt],
@@ -530,13 +495,15 @@ async function addPosWithStop(acc, sym, displayName, pos, dir, status){
     ["止损价(预计)", estStop.toFixed(rule.pricePrec||2)],
     ["止损规则", "锁定当前浮盈的 50%，止损失败则立即市价平仓"]
   ]);
-  if(!okAdd){ status.textContent = "已取消加仓 "+displayName; return; }
+  if(!okAdd){
+    const m = "已取消加仓 "+displayName;
+    status.textContent = m;
+    return m;
+  }
   // 3) 市价加仓
   status.textContent = "正在市价加仓 "+displayName+" "+dirTxt+" "+qty+" …";
-  const rAdd = await placeOrder(FAPI, sym, dir==="LONG"?"BUY":"SELL", dir, qty, false, acc);
-  if(!(rAdd && rAdd.orderId)){
-    throw new Error("加仓失败：" + orderErrText(rAdd));
-  }
+  const rAdd = await placeOrder(sym, openSide(dir), dir, qty, false, acc);
+  if(!(rAdd && rAdd.orderId)) throw new Error("加仓失败：" + orderErrText(rAdd));
   // 4) 等持仓快照更新，再按【加仓后的新持仓】算止损价并挂单
   status.textContent = "加仓已成交，正在设置止损 …";
   let posAfter = null;
@@ -573,53 +540,50 @@ async function addPosWithStop(acc, sym, displayName, pos, dir, status){
 // ROI > 100% → 加仓当前持仓的 38% + 立即挂止损（止损价=入场价+浮盈×50%），止损失败则立即市价平仓；
 // ROI < -100% → 按该方向当前持仓数量等量加仓。
 // 同交易对多空双仓（对冲模式）互不干扰：点"多"卡只动多单，点"空"卡只动空单
+// 市价下单统一入口：拼确认弹窗 → 用户确认 → 下单（开仓 / 等量加仓共用，避免两套重复流程）
+async function confirmAndPlace(acc, sym, displayName, dir, qty, title, rows){
+  const ok = await askConfirm(title, [["交易对", displayName], ["方向", dirLabel(dir)]].concat(rows));
+  if(!ok) return null;
+  return placeOrder(sym, openSide(dir), dir, qty, false, acc);
+}
 async function tradePair(displayName, accId, wantDir){
   const accs = getAccounts();
   const acc = accs.find(a=>a.id===accId) || accs[0];
   const status = document.getElementById("status");
   if(!acc){ status.textContent = "请先点「设置」填写 API Key / Secret"; openSettings(); return; }
-  const key = acc.key, secret = acc.secret;
   // 交割合约显示名 → 真实 symbol（如 "BTC当季" → BTCUSDT_261225）
   let dlSym = null;
   for(const base of ["BTC","ETH"]){
     for(const d of DELIV[base]){ if(d.display===displayName){ dlSym=d.symbol; break; } }
     if(dlSym) break;
   }
-  const host = FAPI;                          // BTCU/ETHU 都是 U 本位，统一走 fapi
   const rawSym = dlSym || displayName;        // BTCU/ETHU 本身就是 fapi 的 symbol，不需要换算
   const dir = wantDir==="SHORT" ? "SHORT" : "LONG";   // 点击卡片的方向
-  const dirTxt = dir==="LONG" ? "多" : "空";
+  const dirTxt = dirLabel(dir);
   let doneMsg = "";
   try{
     const rules = await ensureRules();
     status.textContent = "正在获取 "+displayName+" 持仓…";
-    const positions = await fetchPositions(key, secret);
-    const held = (Array.isArray(positions)?positions:[]).filter(p=>
-      p.symbol===rawSym && parseFloat(p.positionAmt)!==0);
+    const held = await getPositionsOf(acc, rawSym);
     // 该方向的持仓（同交易对多空双仓互不干扰）
     const pos = held.find(p=>posDir(p)===dir);
     if(!pos){
       // 无该方向持仓：按点击的方向市价开仓 100 USDT（占位卡点"空"就开空，点"多"就开多）
-      const price = await fetchPrice(host, rawSym);
+      const price = await fetchPrice(rawSym);
       if(!(price>0)){ status.textContent = displayName+" 获取价格失败，未开仓"; return; }
       // U 本位数量单位就是币：100 USDT 按现价折算成币数量，再按该 symbol 的步长向下取整
       const step = (rules[rawSym]||{}).step;
-      const qty = roundDownToStep(100/price, step);
+      const qty = floorToStep(100/price, step);
       if(!(qty>0)){ status.textContent = displayName+" 开仓数量过小（步长 "+step+"，100/价格="+(100/price).toFixed(6)+"），未开仓"; return; }
-      const qtyTxt = String(qty);
       const estUsd = qty*price;
-      status.textContent = "等待确认开仓 "+displayName+" "+dirTxt+" "+qtyTxt+"（≈"+estUsd.toFixed(2)+" USDT）…";
-      const okOpen = await askConfirm("确认开仓？", [
-        ["交易对", displayName],
-        ["方向", dirTxt],
-        ["数量", qtyTxt],
+      status.textContent = "等待确认开仓 "+displayName+" "+dirTxt+" "+qty+"（≈"+estUsd.toFixed(2)+" USDT）…";
+      const r = await confirmAndPlace(acc, rawSym, displayName, dir, qty, "确认开仓？", [
+        ["数量", String(qty)],
         ["预估价值", "≈"+estUsd.toFixed(2)+" USDT"],
         ["下单类型", "市价 MARKET"]
       ]);
-      if(!okOpen){ status.textContent = "已取消开仓 "+displayName; return; }
-      status.textContent = "开仓 "+displayName+" "+dirTxt+" "+qtyTxt+"（≈"+estUsd.toFixed(2)+" USDT）…";
-      const r = await placeOrder(host, rawSym, dir==="LONG"?"BUY":"SELL", dir, qty, false, acc);
-      doneMsg = (r && r.orderId) ? "开仓成功 "+displayName+" "+dirTxt+" "+qtyTxt+"（order "+r.orderId+"）" : "开仓失败 "+displayName+"："+orderErrText(r);
+      if(!r){ status.textContent = "已取消开仓 "+displayName; return; }
+      doneMsg = (r.orderId) ? "开仓成功 "+displayName+" "+dirTxt+" "+qty+"（order "+r.orderId+"）" : "开仓失败 "+displayName+"："+orderErrText(r);
     }else{
       const amt = parseFloat(pos.positionAmt);
       const ps = posDir(pos);
@@ -629,30 +593,23 @@ async function tradePair(displayName, accId, wantDir){
         status.textContent = "ROI "+info.roi.toFixed(2)+"% > 100%，准备 38% 加仓并设止损…";
         doneMsg = await addPosWithStop(acc, rawSym, displayName, info, ps, status);
       }else if(info.roi < -100){
-        // 加仓：按该方向当前持仓数量原数量加仓（方向与点击卡片一致，绝不加错方向）
-        // U 本位持仓数量本身就是币数量，按该 symbol 步长取整后直接同量加仓
-        const stepAdd = (rules[rawSym]||{}).step;
-        const qty = roundDownToStep(Math.abs(amt), stepAdd);
+        // 加仓：按该方向当前持仓数量等量加仓（方向与点击卡片一致，绝不加错方向）
+        const qty = floorToStep(Math.abs(amt), (rules[rawSym]||{}).step);
         if(!(qty>0)){ status.textContent = displayName+" 加仓数量过小，未加仓"; return; }
-        const qtyTxtAdd = String(qty);
-        status.textContent = "等待确认加仓 "+displayName+" "+dirTxt+" "+qtyTxtAdd+"（ROI "+info.roi.toFixed(2)+"% < -100%）…";
-        const okAdd = await askConfirm("确认加仓？", [
-          ["交易对", displayName],
-          ["方向", dirTxt],
+        status.textContent = "等待确认加仓 "+displayName+" "+dirTxt+" "+qty+"（ROI "+info.roi.toFixed(2)+"% < -100%）…";
+        const r = await confirmAndPlace(acc, rawSym, displayName, dir, qty, "确认加仓？", [
           ["当前回报率", info.roi.toFixed(2)+"%"],
-          ["加仓数量", qtyTxtAdd],
+          ["加仓数量", String(qty)],
           ["下单类型", "市价 MARKET"]
         ]);
-        if(!okAdd){ status.textContent = "已取消加仓 "+displayName; return; }
-        status.textContent = "加仓 "+displayName+" "+dirTxt+" "+qtyTxtAdd+"（ROI "+info.roi.toFixed(2)+"% < -100%）…";
-        const r = await placeOrder(host, rawSym, ps==="LONG"?"BUY":"SELL", ps, qty, false, acc);
-        doneMsg = (r && r.orderId) ? "加仓成功 "+displayName+" "+dirTxt+" "+qtyTxtAdd+"（order "+r.orderId+"）" : "加仓失败 "+displayName+"："+orderErrText(r);
+        if(!r){ status.textContent = "已取消加仓 "+displayName; return; }
+        doneMsg = (r.orderId) ? "加仓成功 "+displayName+" "+dirTxt+" "+qty+"（order "+r.orderId+"）" : "加仓失败 "+displayName+"："+orderErrText(r);
       }else{
         doneMsg = displayName+" "+dirTxt+" 回报率 "+info.roi.toFixed(2)+"%（-100%~+100% 之间），不操作";
       }
     }
     await fetchData(acc.id);   // 按当前账户刷新，加仓后不跳回第一个账户
-    if(doneMsg) document.getElementById("status").textContent = doneMsg;
+    if(doneMsg) status.textContent = doneMsg;
   }catch(e){
     status.textContent = "操作失败 "+displayName+"："+e.message;
   }
@@ -693,7 +650,7 @@ async function fetchData(accId){
   if(sel && String(sel.value) !== String(acc.id)) sel.value = String(acc.id);
   document.getElementById("status").textContent = "正在加载 "+acc.name+" …";
   try{
-    await ensureDeliveryPairs();
+    await ensureMeta();
     // BTCU/ETHU 就是 U 本位(fapi)的独立 symbol，直接从 fapi 一次拉全，
     // 不再请求币本位 dapi（dapi 一旦不可达会把整页拖成 "加载失败: Failed to fetch"）
     const data = await fetchPositions(acc.key, acc.secret);
