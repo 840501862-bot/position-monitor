@@ -240,19 +240,31 @@ async function postJson(url, apiKey){
     try{ return JSON.parse(txt); }catch(e){ return txt; }
   }finally{ clearTimeout(t); }
 }
-// 交易所精度表（stepSize）缓存
-let stepMapCache=null;
-async function ensureStepMap(){
-  if(stepMapCache) return;
+// 交易规则缓存（数量步长 / 最小数量 / 最小名义 / 价格精度），加仓与止损都用它
+let ruleMapCache=null;
+async function ensureRules(){
+  if(ruleMapCache) return ruleMapCache;
   try{
     const d = await fetchJson(FAPI+"/fapi/v1/exchangeInfo", 30000);
-    stepMapCache = {};
+    const map = {};
     for(const s of (d.symbols||[])){
-      const f = (s.filters||[]).find(x=>x.filterType==="LOT_SIZE");
-      if(f) stepMapCache[s.symbol] = parseFloat(f.stepSize);
+      const f = {};
+      for(const x of (s.filters||[])) f[x.filterType] = x;
+      const lot = f.MARKET_LOT_SIZE || f.LOT_SIZE || {};
+      let step = parseFloat(lot.stepSize)||0;
+      if(step<=0) step = Math.pow(10, -(parseInt(s.quantityPrecision,10)||4));
+      map[s.symbol] = {
+        step: step,
+        minQty: parseFloat(lot.minQty)||0,
+        minNotional: parseFloat((f.MIN_NOTIONAL||{}).notional)||0,
+        pricePrec: parseInt(s.pricePrecision,10)||2
+      };
     }
-  }catch(e){ stepMapCache = {}; }
+    ruleMapCache = map;
+  }catch(e){ ruleMapCache = {}; }
+  return ruleMapCache;
 }
+const sleep = ms => new Promise(r=>setTimeout(r, ms));
 let priceCache={}, priceCacheTs=0;
 async function fetchPrice(host, sym){
   const k = host+"|"+sym;
@@ -268,11 +280,29 @@ function roundDownToStep(qty, step){
   return Math.floor(qty*Math.pow(10,d))/Math.pow(10,d);
 }
 // 带签名的 GET（查询持仓模式等只读接口）
-async function signedGet(host, path, acc){
+async function signedGet(host, path, acc, extra){
   await ensureOffset();
-  const q = "timestamp="+(await nowMs())+"&recvWindow=10000";
+  const parts = (extra||[]).slice();
+  parts.push("timestamp="+(await nowMs()), "recvWindow=10000");
+  const q = parts.join("&");
   const sig = await hexSign(acc.secret, q);
   return fetchJson(host+"/"+apiBase(host)+path+"?"+q+"&signature="+sig, 15000, acc.key);
+}
+// 通用签名请求（DELETE / POST 等，/v1/order、/v1/openOrders 用）
+async function signedReq(method, host, path, params, acc){
+  await ensureOffset();
+  const parts = (params||[]).slice();
+  parts.push("timestamp="+(await nowMs()), "recvWindow=10000");
+  const q = parts.join("&");
+  const sig = await hexSign(acc.secret, q);
+  const url = host+"/"+apiBase(host)+path+"?"+q+"&signature="+sig;
+  const ctl = new AbortController();
+  const t = setTimeout(()=>ctl.abort(), 20000);
+  try{
+    const r = await fetch(url, {method:method, headers:{"X-MBX-APIKEY":acc.key}, signal:ctl.signal});
+    const txt = await r.text();
+    try{ return JSON.parse(txt); }catch(e){ return txt; }
+  }finally{ clearTimeout(t); }
 }
 // 该市场的持仓模式：true=双向(对冲)，false=单向，null=未知。
 // 注意：U本位(fapi) 与币本位(dapi) 的持仓模式是分开设置的，必须各自查询
@@ -324,8 +354,224 @@ function posDir(p){
   if(s==="LONG" || s==="SHORT") return s;
   return parseFloat(p.positionAmt)>0 ? "LONG" : "SHORT";
 }
-// 每个交易对的"加仓"按钮逻辑：按点击卡片的方向操作（绝不加错方向）——
-// 无该方向持仓 → 按该方向开100USDT / 该方向ROI>100% → 只平该方向 / 该方向ROI<-100% → 按该方向当前数量加仓
+/* ============ 38% 加仓 + 立即设止损（移植自 roi-board 的加仓止损逻辑） ============ */
+// 查单方向持仓（含入场均价，用于算止损）
+async function getPosition(acc, sym, dir){
+  const data = await fetchPositions(acc.key, acc.secret);
+  if(!Array.isArray(data)) return null;
+  for(const p of data){
+    if(p.symbol!==sym) continue;
+    const amt = parseFloat(p.positionAmt)||0;
+    if(amt===0) continue;
+    if((dir==="LONG" && amt>0) || (dir==="SHORT" && amt<0)) return positionInfo(p);
+  }
+  return null;
+}
+// 撤掉该方向已有的旧止损（普通 STOP_MARKET + reduceOnly），换新止损前先清干净
+async function cancelPosSL(acc, sym, dir){
+  let cancelled = 0;
+  try{
+    const d = await signedGet(FAPI, "/v1/openOrders", acc, ["symbol="+sym]);
+    const list = Array.isArray(d) ? d : [];
+    const wantSide = dir==="LONG" ? "SELL" : "BUY";
+    const wantPS = dir==="LONG" ? ["LONG","BOTH"] : ["SHORT","BOTH"];
+    for(const o of list){
+      if(String(o.type)!=="STOP_MARKET") continue;
+      if(String(o.side)!==wantSide) continue;
+      if(wantPS.indexOf(String(o.positionSide))<0) continue;
+      if(!(o.reduceOnly===true || String(o.reduceOnly)==="true")) continue;
+      for(let t=0; t<3; t++){
+        try{
+          const r = await signedReq("DELETE", FAPI, "/v1/order", ["symbol="+sym, "orderId="+o.orderId], acc);
+          if(r && r.code===undefined){ cancelled++; break; }
+        }catch(e){ await sleep(250*(t+1)); }
+      }
+    }
+  }catch(e){}
+  return cancelled;
+}
+/* 挂止损（STOP_MARKET）：
+   止损价 = 入场均价 + 当前浮盈的 50%（多单）；空单对称 = 入场价 -（入场价-现价）×50%
+   止损价永远夹在入场价与现价之间，锁定当前浮盈的一半，绝不会挂在亏损位。
+   双向模式：positionSide=LONG/SHORT，不能带 reduceOnly；
+   单向模式：positionSide=BOTH + reduceOnly=true（数量算错也只会减仓，不会反向开仓）。 */
+async function setStopLoss(acc, sym, pos, dir){
+  const rule = (await ensureRules())[sym] || {step:0, pricePrec:2};
+  const amtAbs = Math.abs(pos.amt);
+  if(!(amtAbs>0)) throw new Error("无持仓，无需设止损");
+  if(!(pos.unrealized>0)) throw new Error("当前无浮盈，跳过止损设置");
+  let slQty = amtAbs;
+  if(rule.step>0) slQty = parseFloat((Math.floor(amtAbs/rule.step)*rule.step).toFixed(10));
+  if(!(slQty>0)) slQty = amtAbs;
+  const side = pos.amt>0 ? "SELL" : "BUY";
+  let stopPrice;
+  if(pos.entry>0){
+    const ppu = pos.amt>0 ? (pos.mark-pos.entry) : (pos.entry-pos.mark);
+    stopPrice = pos.amt>0 ? (pos.entry+ppu*0.5) : (pos.entry-ppu*0.5);
+    stopPrice = pos.amt>0
+      ? Math.min(Math.max(stopPrice, pos.entry), pos.mark)
+      : Math.max(Math.min(stopPrice, pos.entry), pos.mark);
+  }else{
+    const half = pos.unrealized*0.5/amtAbs;
+    stopPrice = pos.amt>0 ? pos.mark-half : pos.mark+half;
+  }
+  const nudge = () => {
+    const buf = pos.mark*0.005;
+    if(pos.amt>0){ const fl = pos.entry>0 ? pos.entry*1.001 : -Infinity; return Math.max(pos.mark-buf, fl); }
+    const ce = pos.entry>0 ? pos.entry*0.999 : Infinity;
+    return Math.min(pos.mark+buf, ce);
+  };
+  let lastErr = null;
+  // 持仓模式未知时，两种参数组合都试一遍（双向：positionSide=方向，不带 reduceOnly；
+  // 单向：positionSide=BOTH + reduceOnly=true），遇 -4061 / -1106 自动换下一种
+  const dual = await isDualSide(FAPI, acc);
+  const cands = dual===true ? [{ps:dir, ro:false}]
+             : dual===false ? [{ps:"BOTH", ro:true}]
+             : [{ps:dir, ro:false}, {ps:"BOTH", ro:true}];
+  for(let attempt=0; attempt<2; attempt++){
+    const trigger = stopPrice.toFixed(rule.pricePrec||2);
+    for(const cand of cands){
+      let data=null, netErr=null;
+      try{
+        const params = ["symbol="+sym, "side="+side, "type=STOP_MARKET",
+          "stopPrice="+trigger, "quantity="+slQty, "timeInForce=GTE_GTC"];
+        if(cand.ro) params.push("reduceOnly=true");
+        params.push("positionSide="+cand.ps);
+        data = await signedReq("POST", FAPI, "/v1/order", params, acc);
+      }catch(e){ netErr=e; }
+      if(netErr){ lastErr=netErr; await sleep(700); break; }
+      if(data && data.code!==undefined){
+        lastErr = data;
+        if(data.code===-1106 || data.code===-4061) continue;             // 持仓模式/仓位侧不符 → 换下一种参数
+        if(data.code===-1021){ syncOk = false; break; }                  // 时间偏差 → 重同步后重试
+        if(data.code===-2021 || data.code===-4004){ stopPrice = nudge(); break; } // 触发价太近 → 推远
+        break;
+      }
+      if(data && data.orderId) return {stopPrice:stopPrice, orderId:data.orderId, qty:slQty};
+      if(data) return {stopPrice:stopPrice, orderId:null, qty:slQty};
+    }
+    if(attempt<1) await sleep(800);
+  }
+  if(lastErr && lastErr.code!==undefined) throw new Error("code "+lastErr.code+": "+(lastErr.msg||""));
+  throw new Error((lastErr && lastErr.message) || "网络错误（已重试）");
+}
+/* 止损失败的兜底：立即市价平掉该方向仓位（绝不留裸仓）。
+   下单前按步长取整数量；每次下单后回查持仓，只有仓位真的清掉才算成功。 */
+async function closePositionMarket(acc, sym, dir){
+  let lastErr = null;
+  for(let attempt=0; attempt<4; attempt++){
+    let pos=null;
+    try{ pos = await getPosition(acc, sym, dir); }
+    catch(e){ lastErr=e; await sleep(800); continue; }
+    if(!pos) return await finishClosed(acc, sym, dir);          // 已无仓位
+    const rule = (await ensureRules())[sym] || {step:0};
+    let qty = Math.abs(pos.amt);
+    if(rule.step>0) qty = parseFloat((Math.floor(qty/rule.step)*rule.step).toFixed(10));
+    if(!(qty>0)) return await finishClosed(acc, sym, dir);       // 只剩碎仓
+    const before = Math.abs(pos.amt);
+    const side = pos.amt>0 ? "SELL" : "BUY";
+    let r=null, netErr=null;
+    try{ r = await placeOrder(FAPI, sym, side, dir, qty, true, acc); }catch(e){ netErr=e; }
+    if(netErr){ lastErr=netErr; await sleep(1200); continue; }
+    if(r && r.code!==undefined){
+      lastErr = r;
+      if(r.code===-1003 || r.code===-1015 || r.code===-1004){ await sleep(1500*(attempt+1)); continue; }
+      if(r.code===-1021){ syncOk = false; await sleep(500); continue; }
+      await sleep(600); continue;
+    }
+    // 下单已受理：等成交回报，再回查持仓（双向模式下重复下市价单会反手开新仓，绝不重下）
+    for(let k=0; k<6; k++){
+      await sleep(500);
+      let now=null;
+      try{ now = await getPosition(acc, sym, dir); }catch(e){}
+      if(!now) return await finishClosed(acc, sym, dir);
+      if(Math.abs(now.amt) < before) break;
+    }
+  }
+  let left=null;
+  try{ left = await getPosition(acc, sym, dir); }catch(e){}
+  if(left){
+    const rule = (await ensureRules())[sym] || {step:0};
+    if(!(rule.step>0 && Math.abs(left.amt) < rule.step)){
+      return {closed:false, reason:(lastErr && (lastErr.msg || lastErr.message)) || "市价平仓未确认"};
+    }
+  }
+  return await finishClosed(acc, sym, dir);
+}
+async function finishClosed(acc, sym, dir){
+  try{ await cancelPosSL(acc, sym, dir); }catch(e){}
+  return {closed:true};
+}
+/* ============ 加仓 38% + 设止损 + 失败即平仓（ROI>100% 的卡片走这条） ============ */
+async function addPosWithStop(acc, sym, displayName, pos, dir, status){
+  const rule = (await ensureRules())[sym] || {step:0, minQty:0, minNotional:0, pricePrec:2};
+  const dirTxt = dir==="LONG" ? "多" : "空";
+  const mark = pos.mark;
+  // 1) 数量 = 当前持仓的 38%，按步长向下取整；不足最小名义/最小数量时退到最小可下单量
+  let qty = Math.abs(pos.amt) * 0.38;
+  if(rule.step>0) qty = parseFloat((Math.floor(qty/rule.step)*rule.step).toFixed(10));
+  let useMin = false;
+  if(qty<=0 || (rule.minNotional>0 && qty*mark < rule.minNotional) || (rule.minQty>0 && qty < rule.minQty)){
+    qty = rule.minNotional>0 ? (rule.minNotional+1)/mark : qty;
+    if(rule.minQty>0 && qty < rule.minQty) qty = rule.minQty;
+    if(rule.step>0) qty = parseFloat((Math.ceil(qty/rule.step)*rule.step).toFixed(10));
+    useMin = true;
+  }
+  if(!(qty>0)) throw new Error("计算出的加仓数量为 0");
+  // 2) 预估止损价（加仓后均价会变，真实止损价在成交后按新持仓重算）
+  const estStop = pos.entry>0
+    ? (pos.amt>0 ? pos.entry + (mark-pos.entry)*0.5 : pos.entry - (pos.entry-mark)*0.5)
+    : mark;
+  const okAdd = await askConfirm("确认加仓 38% 并设置止损？", [
+    ["交易对", displayName],
+    ["方向", dirTxt],
+    ["当前回报率", pos.roi.toFixed(2)+"%"],
+    ["加仓数量", (useMin ? qty+"（按最小可下单量）" : qty+"（当前持仓38%）")],
+    ["止损价(预计)", estStop.toFixed(rule.pricePrec||2)],
+    ["止损规则", "锁定当前浮盈的 50%，止损失败则立即市价平仓"]
+  ]);
+  if(!okAdd){ status.textContent = "已取消加仓 "+displayName; return; }
+  // 3) 市价加仓
+  status.textContent = "正在市价加仓 "+displayName+" "+dirTxt+" "+qty+" …";
+  const rAdd = await placeOrder(FAPI, sym, dir==="LONG"?"BUY":"SELL", dir, qty, false, acc);
+  if(!(rAdd && rAdd.orderId)){
+    throw new Error("加仓失败：" + orderErrText(rAdd));
+  }
+  // 4) 等持仓快照更新，再按【加仓后的新持仓】算止损价并挂单
+  status.textContent = "加仓已成交，正在设置止损 …";
+  let posAfter = null;
+  for(let t=0; t<4; t++){
+    await sleep(500);
+    try{ posAfter = await getPosition(acc, sym, dir); }catch(e){}
+    if(posAfter && Math.abs(posAfter.amt) > Math.abs(pos.amt)+qty*0.5) break;
+  }
+  if(!posAfter) throw new Error("加仓已成交，但查不到最新持仓——请立即手动设置止损");
+  try{
+    await cancelPosSL(acc, sym, dir);                     // 先撤旧止损
+    const sl = await setStopLoss(acc, sym, posAfter, dir); // 再挂新止损
+    const riskUsd = posAfter.unrealized*0.5;
+    const okTxt = displayName+" 加仓成功："+qty+"（38%）· 新止损 "+sl.stopPrice.toFixed(rule.pricePrec||2)+
+      "（浮盈回撤 50% 即触发，约 "+riskUsd.toFixed(2)+" U）";
+    status.textContent = okTxt;
+    return okTxt;
+  }catch(slErr){
+    // 5) 止损失败 → 立即市价平仓（不留裸仓）
+    status.textContent = displayName+" 设止损失败："+slErr.message+" → 正在市价平仓 …";
+    let closed = {closed:false, reason:"平仓未执行"};
+    try{ closed = await closePositionMarket(acc, sym, dir); }catch(ce){ closed = {closed:false, reason:ce.message}; }
+    if(closed.closed){
+      const m = displayName+" 设止损失败（"+slErr.message+"），已立即市价平仓";
+      status.textContent = m;
+      return m;
+    }else{
+      throw new Error("设止损失败且市价平仓失败（"+closed.reason+"）——请立即在币安手动平仓");
+    }
+  }
+}
+// 每个交易对的"加仓"按钮逻辑：
+// 无该方向持仓 → 按该方向开 100USDT；
+// ROI > 100% → 加仓当前持仓的 38% + 立即挂止损（止损价=入场价+浮盈×50%），止损失败则立即市价平仓；
+// ROI < -100% → 按该方向当前持仓数量等量加仓。
 // 同交易对多空双仓（对冲模式）互不干扰：点"多"卡只动多单，点"空"卡只动空单
 async function tradePair(displayName, accId, wantDir){
   const accs = getAccounts();
@@ -345,7 +591,7 @@ async function tradePair(displayName, accId, wantDir){
   const dirTxt = dir==="LONG" ? "多" : "空";
   let doneMsg = "";
   try{
-    await ensureStepMap();
+    const rules = await ensureRules();
     status.textContent = "正在获取 "+displayName+" 持仓…";
     const positions = await fetchPositions(key, secret);
     const held = (Array.isArray(positions)?positions:[]).filter(p=>
@@ -357,7 +603,7 @@ async function tradePair(displayName, accId, wantDir){
       const price = await fetchPrice(host, rawSym);
       if(!(price>0)){ status.textContent = displayName+" 获取价格失败，未开仓"; return; }
       // U 本位数量单位就是币：100 USDT 按现价折算成币数量，再按该 symbol 的步长向下取整
-      const step = stepMapCache[rawSym];
+      const step = (rules[rawSym]||{}).step;
       const qty = roundDownToStep(100/price, step);
       if(!(qty>0)){ status.textContent = displayName+" 开仓数量过小（步长 "+step+"，100/价格="+(100/price).toFixed(6)+"），未开仓"; return; }
       const qtyTxt = String(qty);
@@ -379,21 +625,13 @@ async function tradePair(displayName, accId, wantDir){
       const ps = posDir(pos);
       const info = positionInfo(pos);
       if(info.roi > 100){
-        // 平仓：只平点击方向的持仓，另一方向的仓位不受影响
-        let any = false;
-        for(const q of held){
-          if(posDir(q)!==ps) continue;
-          const qtyStr = q.positionAmt.startsWith("-") ? q.positionAmt.slice(1) : q.positionAmt;
-          status.textContent = "平仓 "+displayName+" "+dirTxt+"（ROI "+info.roi.toFixed(2)+"% > 100%）…";
-          const r = await placeOrder(host, rawSym, ps==="LONG"?"SELL":"BUY", ps, qtyStr, true, acc);
-          if(!(r && r.orderId)){ status.textContent = "平仓失败 "+displayName+"："+orderErrText(r); return; }
-          any = true;
-        }
-        doneMsg = any ? "平仓成功 "+displayName+" "+dirTxt+"（order 已成交）" : displayName+" "+dirTxt+" 无持仓，不操作";
+        // ROI>100%：按当前持仓的 38% 加仓 → 立即挂止损（锁当前浮盈的 50%）→ 止损失败立即市价平仓
+        status.textContent = "ROI "+info.roi.toFixed(2)+"% > 100%，准备 38% 加仓并设止损…";
+        doneMsg = await addPosWithStop(acc, rawSym, displayName, info, ps, status);
       }else if(info.roi < -100){
         // 加仓：按该方向当前持仓数量原数量加仓（方向与点击卡片一致，绝不加错方向）
         // U 本位持仓数量本身就是币数量，按该 symbol 步长取整后直接同量加仓
-        const stepAdd = stepMapCache[rawSym];
+        const stepAdd = (rules[rawSym]||{}).step;
         const qty = roundDownToStep(Math.abs(amt), stepAdd);
         if(!(qty>0)){ status.textContent = displayName+" 加仓数量过小，未加仓"; return; }
         const qtyTxtAdd = String(qty);
@@ -432,7 +670,8 @@ function positionInfo(p){
   }
   const roi = margin>0 ? unrealized/margin*100 : 0;
   const notional = Math.abs(amt)*mark;
-  return {amt, mark, unrealized, roi, notional};
+  const entry = parseFloat(p.entryPrice)||0;
+  return {amt, entry, mark, unrealized, roi, notional};
 }
 
 async function fetchData(accId){
